@@ -115,31 +115,16 @@ class AutomationPanel(QWidget):
         self._event_edit.setPlaceholderText("Event title (substring) - tiket.com only")
         self._event_edit.setMinimumWidth(260)
         self._package_edit = QLineEdit()
-        self._package_edit.setPlaceholderText("Comma-separated, e.g. 'CAT 1 RIGHT, CAT 1 LEFT, FESTIVAL B'")
+        self._package_edit.setPlaceholderText("Comma-separated fallback, e.g. 'CAT 1, VIP A, FESTIVAL'")
         self._package_edit.setMinimumWidth(260)
-        self._category_edit = QLineEdit()
-        self._category_edit.setPlaceholderText("Comma-separated, e.g. 'CAT 1, FESTIVAL'")
-        self._category_edit.setMinimumWidth(260)
         self._quantity_spin = QSpinBox()
         self._quantity_spin.setRange(1, 20)
         self._quantity_spin.setValue(1)
-        self._presale_wait = QCheckBox("Wait for pre-sale countdown to elapse (auto-resume)")
+        self._presale_wait = QCheckBox("Auto-wait for pre-sale & resume at sale time")
         self._presale_wait.setChecked(True)
-        self._presale_max = QSpinBox()
-        self._presale_max.setRange(1, 1440)
-        self._presale_max.setValue(30)
-        self._presale_max.setSuffix(" min")
-        self._presale_max.setToolTip(
-            "Only used when the countdown can't be parsed. When the page shows a "
-            "countdown / start time, the workflow waits exactly until then (up to 24h)."
-        )
-        self._queue_wait = QCheckBox("Wait in queue / waiting room")
+        self._queue_wait = QCheckBox("Auto-wait in queue / waiting room")
         self._queue_wait.setChecked(True)
-        self._queue_max = QSpinBox()
-        self._queue_max.setRange(1, 360)
-        self._queue_max.setValue(60)
-        self._queue_max.setSuffix(" min")
-        self._login_first = QCheckBox("Sign in before running (uses profile login credentials)")
+        self._login_first = QCheckBox("Sign in (use profile login credentials)")
         self._login_first.setChecked(True)
         for label, widget in (
             ("Plugin", self._plugin_combo),
@@ -147,14 +132,11 @@ class AutomationPanel(QWidget):
             ("Target URL", self._url_edit),
             ("Search query", self._search_edit),
             ("Event title", self._event_edit),
-            ("Category", self._category_edit),
             ("Package", self._package_edit),
             ("Quantity", self._quantity_spin),
-            ("Pre-sale auto-wait", self._presale_wait),
-            ("Pre-sale max wait", self._presale_max),
-            ("Queue auto-wait", self._queue_wait),
-            ("Queue max wait", self._queue_max),
-            ("Login first", self._login_first),
+            ("Pre-sale", self._presale_wait),
+            ("Queue", self._queue_wait),
+            ("Login", self._login_first),
         ):
             make_form_row(form, label, widget)
         layout.addLayout(form)

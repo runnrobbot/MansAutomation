@@ -53,19 +53,40 @@ _OTP_KEYWORDS = (
 )
 
 # Shared JS that tags and returns every leaf package card. Works against the
-# main page or any child frame. A *leaf* card is the tightest ancestor of a
-# single Pilih/Select button.
+# main page or any child frame. A *leaf* card is the smallest ancestor that
+# contains exactly one package action button. Action buttons cover the normal
+# "Pilih"/"Select"/"Beli" CTAs AND membership "Verify code"/"Verifikasi kode"
+# buttons used by Weverse / fan-club early-access packages.
 _CARD_ENUMERATION_JS = r"""() => {
     document.querySelectorAll('[data-mans-package-card]').forEach(
         (el) => el.removeAttribute('data-mans-package-card')
     );
     const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-    const isPilih = (b) => /\bPilih\b|\bSelect\b|\bBeli\b/i.test(norm(b.innerText));
-    const countPilih = (el) => [
+    // A package action button: normal select OR membership verify-code.
+    const VERIFY_RE = /\bVerify\s*code\b|\bVerifikasi\s*kode\b|\bVerify\b|\bVerifikasi\b/i;
+    const SELECT_RE = /\bPilih\b|\bSelect\b|\bBeli\b/i;
+    const isAction = (b) => {
+        const t = norm(b.innerText);
+        return SELECT_RE.test(t) || VERIFY_RE.test(t);
+    };
+    const actionKind = (el) => {
+        // Returns 'verify' if the card's action button is a verify-code
+        // button, else 'select'.
+        const btns = [
+            ...el.querySelectorAll('button'),
+            ...el.querySelectorAll('[role="button"]'),
+            ...el.querySelectorAll('a'),
+        ].filter(isAction);
+        for (const b of btns) {
+            if (VERIFY_RE.test(norm(b.innerText))) return 'verify';
+        }
+        return 'select';
+    };
+    const countAction = (el) => [
         ...el.querySelectorAll('button'),
         ...el.querySelectorAll('[role="button"]'),
         ...el.querySelectorAll('a'),
-    ].filter(isPilih).length;
+    ].filter(isAction).length;
 
     const out = [];
     const clickable = [
@@ -73,19 +94,18 @@ _CARD_ENUMERATION_JS = r"""() => {
         ...document.querySelectorAll('[role="button"]'),
         ...document.querySelectorAll('a'),
     ];
-    const pilihButtons = clickable.filter(isPilih);
+    const actionButtons = clickable.filter(isAction);
     let counter = 0;
     const seen = new Set();
 
-    for (const btn of pilihButtons) {
+    for (const btn of actionButtons) {
         // Climb UP collecting the LARGEST ancestor that still contains
-        // exactly ONE Pilih button. That ancestor is the full package card
-        // (title + price + action), whereas the tightest ancestor would be
-        // just the price/footer row.
+        // exactly ONE action button - that ancestor is the full package card
+        // (title + price + action), not just the footer row.
         let node = btn.parentElement;
         let card = null;
         for (let d = 0; d < 14 && node && node !== document.body; d++) {
-            const n = countPilih(node);
+            const n = countAction(node);
             if (n === 1) {
                 const text = norm(node.innerText);
                 if (text.length > 0 && text.length < 6000) {
@@ -111,7 +131,7 @@ _CARD_ENUMERATION_JS = r"""() => {
             for (const el of els) {
                 const t = norm(el.innerText);
                 if (t && t.length > 3 &&
-                    !/^(Rp|IDR|\d[\d.,]*|Pilih|Select|Beli|Detail|Tidak|Berdiri|Seluruh)/i.test(t)) {
+                    !/^(Rp|IDR|\d[\d.,]*|Pilih|Select|Beli|Verify|Verifikasi|Detail|Tidak|Berdiri|Seluruh)/i.test(t)) {
                     title = t; break;
                 }
             }
@@ -121,10 +141,9 @@ _CARD_ENUMERATION_JS = r"""() => {
         if (!title) {
             const ls = norm(card.innerText).split('\n').map(s => s.trim())
                 .filter(l => l && l.length > 3 &&
-                    !/^(Rp|IDR|\d[\d.,]*|Pilih|Select|Beli|Detail|Tidak|Berdiri|Seluruh)/i.test(l));
+                    !/^(Rp|IDR|\d[\d.,]*|Pilih|Select|Beli|Verify|Verifikasi|Detail|Tidak|Berdiri|Seluruh)/i.test(l));
             title = ls[0] || '';
         }
-        // Last resort: the whole first line (so we still have *something*).
         if (!title) {
             title = norm(card.innerText).split('\n')[0] || '';
         }
@@ -133,6 +152,7 @@ _CARD_ENUMERATION_JS = r"""() => {
             index: counter,
             title: title,
             text: norm(card.innerText).slice(0, 600),
+            action: actionKind(card),
         });
         counter++;
     }
@@ -1531,13 +1551,8 @@ class TiketComPlugin(AutomationPlugin):
     async def _poll_for_pilih(
         self, page: Page, context: PluginContext, *, timeout_ms: int = 10_000
     ) -> bool:
-        """Poll until at least one Pilih/Select button is visible.
-
-        Returns True when buttons are found, False on timeout.
-        Unlike ``_wait_for_packages`` this is a lightweight probe meant
-        to be called AFTER a category click when the DOM is already partially
-        rendered and we just need to wait for React to flush the new cards.
-        """
+        """Poll until at least one package action button (Pilih / Select /
+        Beli / Verify code) is visible. Returns True when found."""
 
         budget = max(500, timeout_ms)
         elapsed = 0
@@ -1546,9 +1561,10 @@ class TiketComPlugin(AutomationPlugin):
             try:
                 found = await page.evaluate(
                     r"""() => {
-                        for (const b of document.querySelectorAll('button')) {
+                        const re = /\bPilih\b|\bSelect\b|\bBeli\b|\bVerify\s*code\b|\bVerifikasi\b/i;
+                        for (const b of document.querySelectorAll('button, [role="button"], a')) {
                             const t = (b.innerText || '').replace(/\s+/g, ' ').trim();
-                            if (/\bPilih\b|\bSelect\b/i.test(t)) return true;
+                            if (re.test(t)) return true;
                         }
                         return false;
                     }"""
@@ -1943,26 +1959,51 @@ class TiketComPlugin(AutomationPlugin):
                 )
             except Exception:  # noqa: BLE001
                 pass
-            # Use JS to locate and click the Pilih/Select button so that
-            # SVG icon children and whitespace don't cause :has-text to miss.
-            clicked = await row.evaluate(
-                """(root) => {
-                    const buttons = root.querySelectorAll('button');
-                    for (const b of buttons) {
-                        const t = (b.innerText || '').replace(/\\s+/g, ' ').trim();
-                        if (/\\bPilih\\b|\\bSelect\\b/i.test(t)) {
-                            b.click();
-                            return true;
-                        }
+            # Click the package action button (Pilih / Select / Beli OR a
+            # membership Verify code button) via JS so SVG icon children and
+            # whitespace can't break a text selector. Returns the matched
+            # button label so the caller knows whether a verify-code step
+            # follows.
+            clicked_label = await row.evaluate(
+                r"""(root) => {
+                    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+                    const SELECT_RE = /\bPilih\b|\bSelect\b|\bBeli\b/i;
+                    const VERIFY_RE = /\bVerify\s*code\b|\bVerifikasi\s*kode\b|\bVerify\b|\bVerifikasi\b/i;
+                    const nodes = [
+                        ...root.querySelectorAll('button'),
+                        ...root.querySelectorAll('[role="button"]'),
+                        ...root.querySelectorAll('a'),
+                    ];
+                    // Prefer a normal select button; fall back to verify-code.
+                    for (const b of nodes) {
+                        if (SELECT_RE.test(norm(b.innerText))) { b.click(); return norm(b.innerText); }
                     }
-                    return false;
+                    for (const b of nodes) {
+                        if (VERIFY_RE.test(norm(b.innerText))) { b.click(); return norm(b.innerText); }
+                    }
+                    return '';
                 }"""
             )
-            if not clicked:
+            if not clicked_label:
                 return False
             await context.sync.wait_for_dom_settle(
                 page=row.page, quiet_ms=200, timeout_ms=2_000
             )
+            # If this was a membership verify-code package, the site now shows
+            # a code-entry modal. We never bypass membership checks: pause for
+            # the operator to enter their Weverse / fan-club code.
+            if re.search(r"verify|verifikasi", clicked_label, re.I):
+                await context.emit_event(
+                    f"membership verify-code package selected ({package_name}) - "
+                    "manual code entry required",
+                    level=WorkflowEventLevel.WARN,
+                )
+                await context.request_human(
+                    "This package needs a membership / Weverse code. Enter your code "
+                    "in the browser and complete verification, then click "
+                    "'I'm done - resume'.",
+                    url=row.page.url,
+                )
             return True
         except Exception as exc:  # noqa: BLE001
             await context.emit_event(
@@ -2004,14 +2045,20 @@ class TiketComPlugin(AutomationPlugin):
         # render or animations may delay them, and we'd rather attempt the
         # click and fail than skip an available package.
         try:
-            # Find the Pilih/Select action button inside this card using JS
-            # so that SVG children / whitespace don't interfere.
+            # Find the action button (Pilih / Select / Beli / Verify code)
+            # inside this card via JS so SVG children / whitespace don't
+            # interfere, and report whether it is disabled.
             disabled_result = await row.evaluate(
-                """(root) => {
-                    const buttons = root.querySelectorAll('button');
-                    for (const b of buttons) {
-                        const t = (b.innerText || '').replace(/\\s+/g, ' ').trim();
-                        if (/\\bPilih\\b|\\bSelect\\b/i.test(t)) {
+                r"""(root) => {
+                    const re = /\bPilih\b|\bSelect\b|\bBeli\b|\bVerify\s*code\b|\bVerifikasi\b/i;
+                    const nodes = [
+                        ...root.querySelectorAll('button'),
+                        ...root.querySelectorAll('[role="button"]'),
+                        ...root.querySelectorAll('a'),
+                    ];
+                    for (const b of nodes) {
+                        const t = (b.innerText || '').replace(/\s+/g, ' ').trim();
+                        if (re.test(t)) {
                             if (b.disabled || b.getAttribute('aria-disabled') === 'true') {
                                 return 'disabled';
                             }
@@ -2073,18 +2120,18 @@ class TiketComPlugin(AutomationPlugin):
         except Exception:  # noqa: BLE001
             pass
 
-        # tiket.com's Pilih button may contain an SVG chevron as a child so
-        # its innerText can be "Pilih" or "▼ Pilih" or have whitespace
-        # around it.  We probe with a JS-based check that is whitespace and
-        # icon-agnostic.
-        async def _has_pilih() -> bool:
+        # tiket.com's action button may contain an SVG chevron as a child so
+        # its innerText can be "Pilih" / "▼ Pilih" / "Verify code". We probe
+        # with a JS check that is whitespace and icon-agnostic and also
+        # matches membership "Verify code" buttons.
+        async def _has_action() -> bool:
             try:
                 found = await page.evaluate(
-                    """() => {
-                        const all = document.querySelectorAll('button');
-                        for (const b of all) {
-                            const t = (b.innerText || '').replace(/\\s+/g, ' ').trim();
-                            if (/\\bPilih\\b|\\bSelect\\b/i.test(t)) return true;
+                    r"""() => {
+                        const re = /\bPilih\b|\bSelect\b|\bBeli\b|\bVerify\s*code\b|\bVerifikasi\b/i;
+                        for (const b of document.querySelectorAll('button, [role="button"], a')) {
+                            const t = (b.innerText || '').replace(/\s+/g, ' ').trim();
+                            if (re.test(t)) return true;
                         }
                         return false;
                     }"""
@@ -2093,19 +2140,19 @@ class TiketComPlugin(AutomationPlugin):
             except Exception:  # noqa: BLE001
                 return False
 
-        # Poll until Pilih buttons appear, up to the speed-scaled budget.
+        # Poll until action buttons appear, up to the speed-scaled budget.
         budget = int(15_000 * speed)
         elapsed = 0
         step = 500
         while elapsed < budget:
-            if await _has_pilih():
+            if await _has_action():
                 break
             await asyncio.sleep(step / 1000)
             elapsed += step
 
-        if not await _has_pilih():
+        if not await _has_action():
             await context.emit_event(
-                "no 'Pilih/Select' buttons found in time - the page may have a queue or CAPTCHA",
+                "no package action buttons found in time - the page may have a queue or CAPTCHA",
                 level=WorkflowEventLevel.WARN,
             )
 
@@ -2114,8 +2161,10 @@ class TiketComPlugin(AutomationPlugin):
         for _ in range(6):
             try:
                 count = await page.evaluate(
-                    r"""() => [...document.querySelectorAll('button')].filter(
-                        b => /\bPilih\b|\bSelect\b/i.test((b.innerText || '').replace(/\s+/g,' ').trim())
+                    r"""() => [...document.querySelectorAll('button, [role="button"], a')].filter(
+                        b => /\bPilih\b|\bSelect\b|\bBeli\b|\bVerify\s*code\b|\bVerifikasi\b/i.test(
+                            (b.innerText || '').replace(/\s+/g,' ').trim()
+                        )
                     ).length"""
                 )
             except Exception:  # noqa: BLE001
