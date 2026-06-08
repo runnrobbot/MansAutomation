@@ -303,32 +303,34 @@ class AutomationPanel(QWidget):
             return
         event_title = self._event_edit.text().strip()
         package_text = self._package_edit.text().strip()
-        category_text = self._category_edit.text().strip()
         query = self._search_edit.text().strip()
         packages = [p.strip() for p in package_text.split(",") if p.strip()]
-        categories = [c.strip() for c in category_text.split(",") if c.strip()]
-        if not event_title and not query:
+        plugin = self._plugins.get(str(plugin_id))
+        url = self._normalize_url(self._url_edit.text()) or self._default_url_for_plugin(plugin)
+        if not url:
+            QMessageBox.warning(self, "Missing URL", "Provide a target URL.")
+            return
+        # When the URL already points at a specific event page, the plugin
+        # opens it directly and no event title / search query is needed.
+        direct_event = self._is_direct_event_url(url)
+        if not direct_event and not event_title and not query:
             QMessageBox.warning(
                 self,
                 "Missing event",
-                "Enter an event keyword or an event title for the booking workflow.",
+                "Paste the event page URL into 'Target URL', or enter an event "
+                "title / search keyword so the event can be found.",
             )
             return
         if not packages:
             QMessageBox.warning(
                 self,
                 "Missing package",
-                "Specify at least one package row, e.g. 'CAT 1 RIGHT - GENERAL SALE'. "
+                "Specify at least one package, e.g. 'CAT 1, VIP A'. "
                 "Use a comma-separated list to fall back across packages.",
             )
             return
         if self._runner.is_running:
             QMessageBox.information(self, "Workflow running", "A workflow is already in progress.")
-            return
-        plugin = self._plugins.get(str(plugin_id))
-        url = self._normalize_url(self._url_edit.text()) or self._default_url_for_plugin(plugin)
-        if not url:
-            QMessageBox.warning(self, "Missing URL", "Provide a target URL.")
             return
         job = WorkflowJob(
             plugin_id=str(plugin_id),
@@ -339,19 +341,21 @@ class AutomationPanel(QWidget):
                 "search_query": query or event_title,
                 "event_title": event_title,
                 "packages": packages,
-                "categories": categories,
-                # Backward-compatible single-value fields used by older plugin versions:
                 "package": packages[0],
-                "category": categories[0] if categories else "",
                 "quantity": int(self._quantity_spin.value()),
                 "login": self._login_first.isChecked(),
                 "presale_wait": self._presale_wait.isChecked(),
-                "presale_max_wait_minutes": int(self._presale_max.value()),
                 "queue_wait": self._queue_wait.isChecked(),
-                "queue_max_wait_minutes": int(self._queue_max.value()),
             },
         )
         run_async(self._submit(job))
+
+    @staticmethod
+    def _is_direct_event_url(url: str) -> bool:
+        lowered = (url or "").lower()
+        if "tiket.com" not in lowered or "/search" in lowered:
+            return False
+        return "/to-do/" in lowered or "/event/" in lowered
 
     @staticmethod
     def _default_url_for_plugin(plugin: AutomationPlugin | None) -> str:

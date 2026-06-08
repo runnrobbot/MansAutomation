@@ -123,20 +123,33 @@ _CARD_ENUMERATION_JS = r"""() => {
 
         card.setAttribute('data-mans-package-card', String(counter));
 
-        // Title: first heading-like element whose text is NOT a price/label.
-        let title = '';
-        for (const sel of ['h1','h2','h3','h4','h5','h6','strong','b',
-                           '[class*="title" i]','[class*="name" i]','[class*="label" i]']) {
-            const els = card.querySelectorAll(sel);
-            for (const el of els) {
-                const t = norm(el.innerText);
-                if (t && t.length > 3 &&
-                    !/^(Rp|IDR|\d[\d.,]*|Pilih|Select|Beli|Verify|Verifikasi|Detail|Tidak|Berdiri|Seluruh)/i.test(t)) {
-                    title = t; break;
+        // Title: climb OUTWARD from the action button and take the nearest
+        // heading-like element. This avoids absorbing a parent section
+        // heading (e.g. "VIP SOUNDCHECK") when a section holds a single
+        // package - the card's own title sits closer to the button.
+        const titleOf = (scope) => {
+            for (const sel of ['h1','h2','h3','h4','h5','h6','strong','b',
+                               '[class*="title" i]','[class*="name" i]','[class*="label" i]']) {
+                const els = scope.querySelectorAll(sel);
+                for (const el of els) {
+                    const t = norm(el.innerText);
+                    if (t && t.length > 3 &&
+                        !/^(Rp|IDR|\d[\d.,]*|Pilih|Select|Beli|Verify|Verifikasi|Detail|Tidak|Berdiri|Seluruh|Early access)/i.test(t)) {
+                        return t;
+                    }
                 }
             }
+            return '';
+        };
+        let title = '';
+        let tnode = btn.parentElement;
+        for (let d = 0; d < 14 && tnode && tnode !== document.body; d++) {
+            title = titleOf(tnode);
             if (title) break;
+            if (tnode === card) break;   // don't climb past the card root
+            tnode = tnode.parentElement;
         }
+        if (!title) title = titleOf(card);
         // Fallback: first text line in the card that looks like a name.
         if (!title) {
             const ls = norm(card.innerText).split('\n').map(s => s.trim())
@@ -828,13 +841,8 @@ class TiketComPlugin(AutomationPlugin):
         )
         quantity = int(params.get("quantity") or 1)
         query = str(params.get("search_query") or event_title).strip()
+        target_url = str(context.job.target_url or "").strip()
 
-        if not query and not event_title:
-            return PluginExecutionResult(
-                success=False,
-                message="event_title or search_query is required for booking",
-                data=result_data,
-            )
         if not packages:
             return PluginExecutionResult(
                 success=False,
@@ -842,22 +850,43 @@ class TiketComPlugin(AutomationPlugin):
                 data=result_data,
             )
 
-        events = await self._search_events(page, context, query or event_title)
-        result_data["search_results"] = len(events)
-        target = self._best_match(events, event_title or query)
-        if not target:
-            return PluginExecutionResult(
-                success=False,
-                message=f"no matching event found for '{event_title or query}'",
-                data=result_data,
-            )
-        result_data["event"] = target
+        speed = max(0.25, float(getattr(context.workflow_settings, "sync_speed_multiplier", 1.0)))
 
-        await context.emit_event("opening event page", context={"url": target["url"]})
-        await page.goto(target["url"], wait_until="domcontentloaded")
+        # If the target URL is already a concrete event page, skip the search
+        # entirely and open it directly. The event title/search query are only
+        # required when we have to discover the event ourselves.
+        if self._is_event_url(target_url):
+            await context.emit_event(
+                "target URL is an event page - opening directly (skipping search)",
+                context={"url": target_url},
+            )
+            await page.goto(target_url, wait_until="domcontentloaded")
+            result_data["event"] = {"url": target_url, "title": event_title or "(direct URL)"}
+        else:
+            if not query and not event_title:
+                return PluginExecutionResult(
+                    success=False,
+                    message=(
+                        "Provide either a direct event URL in 'Target URL', or an "
+                        "event title / search query so the event can be found."
+                    ),
+                    data=result_data,
+                )
+            events = await self._search_events(page, context, query or event_title)
+            result_data["search_results"] = len(events)
+            target = self._best_match(events, event_title or query)
+            if not target:
+                return PluginExecutionResult(
+                    success=False,
+                    message=f"no matching event found for '{event_title or query}'",
+                    data=result_data,
+                )
+            result_data["event"] = target
+            await context.emit_event("opening event page", context={"url": target["url"]})
+            await page.goto(target["url"], wait_until="domcontentloaded")
+
         await self._await_human_when_needed(page, context)
         # Wait for the hero CTA to render rather than gambling on networkidle.
-        speed = max(0.25, float(getattr(context.workflow_settings, "sync_speed_multiplier", 1.0)))
         try:
             await page.wait_for_selector(
                 "h1, h2",
@@ -981,6 +1010,26 @@ class TiketComPlugin(AutomationPlugin):
         if isinstance(value, (list, tuple)):
             return [str(piece).strip() for piece in value if str(piece).strip()]
         return []
+
+    @staticmethod
+    def _is_event_url(url: str) -> bool:
+        """True when *url* is a concrete tiket.com event page (not home /
+        category / search)."""
+
+        if not url:
+            return False
+        lowered = url.lower()
+        if "tiket.com" not in lowered:
+            return False
+        if "/search" in lowered:
+            return False
+        for marker in ("/to-do/", "/event/"):
+            idx = lowered.find(marker)
+            if idx >= 0:
+                tail = lowered[idx + len(marker):].split("?")[0].strip("/")
+                if tail and tail != "search":
+                    return True
+        return False
 
     async def _handle_presale(
         self,
