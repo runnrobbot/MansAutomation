@@ -181,16 +181,17 @@ class TiketComPlugin(AutomationPlugin):
 
         result_data: dict[str, Any] = {}
 
-        # Honor the "sign in first" toggle explicitly.
+        # ── Login decision ──────────────────────────────────────────────
+        # Always probe the current session first. The "sign in" toggle only
+        # matters when the session is NOT already authenticated:
         #
-        #   wants_login + credentials  -> run the full login flow. _login()
-        #                                 short-circuits if a session is
-        #                                 already genuinely authenticated.
-        #   wants_login + no creds     -> manual login (booking needs auth).
-        #   not wants_login            -> only probe; for booking we still
-        #                                 require auth, so fall back to manual
-        #                                 sign-in when the probe says anonymous.
-        if wants_login:
+        #   already signed in            -> proceed (skip login entirely)
+        #   anonymous + sign-in ON       -> log in (auto if creds, else manual)
+        #   anonymous + sign-in OFF      -> abort with guidance to enable it
+        already_signed_in = await self._probe_existing_session(page, context)
+        if already_signed_in:
+            result_data["logged_in"] = True
+        elif wants_login:
             if self._has_credentials(context):
                 result_data["logged_in"] = await self._login(page, context)
             else:
@@ -206,21 +207,18 @@ class TiketComPlugin(AutomationPlugin):
                     page, context, "no login credentials configured on profile"
                 )
         else:
-            # Sign-in toggle is OFF. Probe the existing session.
-            already = await self._probe_existing_session(page, context)
-            result_data["logged_in"] = already
-            if not already and action == "book":
-                await context.emit_event(
-                    "booking requires authentication but sign-in is off - manual login",
-                    level=WorkflowEventLevel.WARN,
-                )
-                try:
-                    await page.goto(_LOGIN_URL, wait_until="domcontentloaded")
-                except Exception:  # noqa: BLE001
-                    pass
-                result_data["logged_in"] = await self._request_manual_login(
-                    page, context, "sign-in toggle off but booking requires auth"
-                )
+            # Anonymous + sign-in toggle OFF. Do not touch the login page;
+            # abort with a clear instruction instead.
+            result_data["logged_in"] = False
+            return PluginExecutionResult(
+                success=False,
+                message=(
+                    "You are not signed in to tiket.com and the 'Sign in' option "
+                    "is turned off. Enable 'Sign in' (and set your login email/"
+                    "password on the profile) to use the login feature."
+                ),
+                data=result_data,
+            )
 
         if action == "login":
             return PluginExecutionResult(
@@ -514,18 +512,45 @@ class TiketComPlugin(AutomationPlugin):
         )
 
     async def _is_signed_in(self, page: Page) -> bool:
-        """Strictly check whether the active page reflects an authenticated
-        session.
+        """Determine whether the current tiket.com session is authenticated.
 
-        Only POSITIVE evidence counts:
-          - a visible profile-menu / account DOM element, OR
-          - a strong authentication cookie with a non-empty value.
+        Detection order (most reliable first):
 
-        We deliberately do NOT infer "signed in" from the mere absence of a
-        login button - that produced false positives that skipped the login
-        flow when the user had explicitly requested it.
+          1. A visible login affordance ('Masuk' / 'Daftar' / 'Sign in' /
+             'Login' / a link to /login) => DEFINITELY anonymous.
+          2. A profile-menu / account / avatar element, OR a strong auth
+             cookie => signed in.
+          3. Header present but no login affordance => signed in (tiket.com
+             always shows a login button to anonymous visitors).
+
+        Combining the negative and positive signals avoids both the
+        false-positive (skipping login when anonymous) and the false-negative
+        (sending an authenticated user to the login page).
         """
 
+        # 1) Login affordance => anonymous.  Checked first and thoroughly.
+        login_affordances = (
+            "header a[href*='/login' i]",
+            "a[href*='account.bliblitiket' i]",
+            "header button:has-text('Masuk')",
+            "header button:has-text('Daftar')",
+            "header a:has-text('Masuk')",
+            "header a:has-text('Daftar')",
+            "header :text-is('Masuk')",
+            "header :text-is('Sign in')",
+            "header :text-is('Log in')",
+            "[data-testid*='loginButton' i]",
+            "[data-testid*='signInButton' i]",
+            "[data-testid*='registerButton' i]",
+        )
+        for selector in login_affordances:
+            try:
+                if await page.locator(selector).first.is_visible(timeout=400):
+                    return False
+            except Exception:  # noqa: BLE001
+                continue
+
+        # 2a) Positive DOM signals.
         positive_selectors = (
             "[data-testid='headerProfileMenu']",
             "[data-testid='profileMenu']",
@@ -534,22 +559,23 @@ class TiketComPlugin(AutomationPlugin):
             "[data-testid*='avatar' i]",
             "[class*='profileMenu' i]",
             "[class*='ProfileMenu']",
-            "a[href*='/myorder']",
-            "a[href*='/myaccount']",
-            "a[href*='myaccount']",
+            "a[href*='/myorder' i]",
+            "a[href*='/pesanan' i]",
+            "a[href*='/myaccount' i]",
+            "a[href*='/akun' i]",
             "img[alt*='profile' i]",
             "img[alt*='avatar' i]",
+            "header :text('Keluar')",
+            "header :text('Logout')",
         )
         for selector in positive_selectors:
             try:
-                if await page.locator(selector).first.is_visible(timeout=600):
+                if await page.locator(selector).first.is_visible(timeout=400):
                     return True
             except Exception:  # noqa: BLE001
                 continue
 
-        # Strong auth-cookie probe. Use EXACT cookie-name matches so generic
-        # anonymous cookies (deviceuid, guid, _ga, ...) never trigger a false
-        # positive.
+        # 2b) Strong auth-cookie probe (exact names only).
         try:
             cookies = await page.context.cookies()
         except Exception:  # noqa: BLE001
@@ -574,6 +600,13 @@ class TiketComPlugin(AutomationPlugin):
                 continue
             if name in strong_auth_cookies:
                 return True
+
+        # 3) Header present but no login affordance => signed in.
+        try:
+            if await page.locator("header").first.is_visible(timeout=400):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
         return False
 
     async def _probe_existing_session(self, page: Page, context: PluginContext) -> bool:
@@ -1572,38 +1605,6 @@ class TiketComPlugin(AutomationPlugin):
         if not isinstance(payload, list):
             return []
         return [item for item in payload if isinstance(item, dict) and "index" in item]
-
-    def _pick_best_match(
-        self,
-        cards: list[dict[str, Any]],
-        candidates: list[str],
-    ) -> tuple[dict[str, Any], str, float] | None:
-        """Choose the best (card, candidate) pair across every user input.
-
-        Why this matters: the user supplies a comma-separated fallback list.
-        We want the card whose title best matches *any* of the inputs, not
-        the first input that has any match at all. That way:
-
-            input ["CAT 1 RIGHT", "FESTIVAL B"]
-            page  [FESTIVAL B, FESTIVAL A, CAT 1 RIGHT, CAT 1 LEFT]
-            -> picks CAT 1 RIGHT (score ~100), not the first FESTIVAL row.
-
-        Returns ``(card, matched_input, score)`` or ``None``.
-        """
-
-        if not cards or not candidates:
-            return None
-        best: tuple[dict[str, Any], str, float] | None = None
-        for candidate in candidates:
-            scored = self._score_cards(cards, candidate)
-            if not scored:
-                continue
-            score, card = scored[0]
-            if best is None or score > best[2]:
-                best = (card, candidate, score)
-        if best is None or best[2] < 50:
-            return None
-        return best
 
     @staticmethod
     def _score_cards(

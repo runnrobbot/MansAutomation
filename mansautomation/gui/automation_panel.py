@@ -129,6 +129,12 @@ class AutomationPanel(QWidget):
         self._presale_max.setRange(1, 240)
         self._presale_max.setValue(30)
         self._presale_max.setSuffix(" min")
+        self._queue_wait = QCheckBox("Wait in queue / waiting room")
+        self._queue_wait.setChecked(True)
+        self._queue_max = QSpinBox()
+        self._queue_max.setRange(1, 360)
+        self._queue_max.setValue(60)
+        self._queue_max.setSuffix(" min")
         self._login_first = QCheckBox("Sign in before running (uses profile login credentials)")
         self._login_first.setChecked(True)
         for label, widget in (
@@ -142,6 +148,8 @@ class AutomationPanel(QWidget):
             ("Quantity", self._quantity_spin),
             ("Pre-sale auto-wait", self._presale_wait),
             ("Pre-sale max wait", self._presale_max),
+            ("Queue auto-wait", self._queue_wait),
+            ("Queue max wait", self._queue_max),
             ("Login first", self._login_first),
         ):
             make_form_row(form, label, widget)
@@ -353,6 +361,8 @@ class AutomationPanel(QWidget):
                 "login": self._login_first.isChecked(),
                 "presale_wait": self._presale_wait.isChecked(),
                 "presale_max_wait_minutes": int(self._presale_max.value()),
+                "queue_wait": self._queue_wait.isChecked(),
+                "queue_max_wait_minutes": int(self._queue_max.value()),
             },
         )
         run_async(self._submit(job))
