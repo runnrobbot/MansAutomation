@@ -30,6 +30,7 @@ from rapidfuzz import fuzz
 
 from mansautomation.automation.human_intervention import HumanInterventionDetector
 from mansautomation.automation.presale import SaleStatus, SaleStatusDetector
+from mansautomation.automation.queue_wait import QueueDetector, QueueStatus
 from mansautomation.core.exceptions import HumanInterventionRequired
 from mansautomation.core.models import WorkflowEventLevel
 from mansautomation.plugins.base import (
@@ -180,50 +181,46 @@ class TiketComPlugin(AutomationPlugin):
 
         result_data: dict[str, Any] = {}
 
-        # Check whether the persistent context is already authenticated. We
-        # only navigate to the login screen when the session is anonymous,
-        # which avoids the "already logged in" regression where /login
-        # redirects to the homepage and the email field never appears.
-        already_signed_in = await self._probe_existing_session(page, context)
-        result_data["logged_in"] = already_signed_in
-
-        if not already_signed_in:
-            if wants_login and self._has_credentials(context):
+        # Honor the "sign in first" toggle explicitly.
+        #
+        #   wants_login + credentials  -> run the full login flow. _login()
+        #                                 short-circuits if a session is
+        #                                 already genuinely authenticated.
+        #   wants_login + no creds     -> manual login (booking needs auth).
+        #   not wants_login            -> only probe; for booking we still
+        #                                 require auth, so fall back to manual
+        #                                 sign-in when the probe says anonymous.
+        if wants_login:
+            if self._has_credentials(context):
                 result_data["logged_in"] = await self._login(page, context)
-            elif wants_login and action == "book":
-                # Booking requires an authenticated session. If credentials are
-                # missing, ask the user to sign in manually before proceeding.
-                await page.goto(_LOGIN_URL, wait_until="domcontentloaded")
+            else:
+                await context.emit_event(
+                    "sign-in requested but no credentials on profile - manual login",
+                    level=WorkflowEventLevel.WARN,
+                )
+                try:
+                    await page.goto(_LOGIN_URL, wait_until="domcontentloaded")
+                except Exception:  # noqa: BLE001
+                    pass
                 result_data["logged_in"] = await self._request_manual_login(
                     page, context, "no login credentials configured on profile"
                 )
-            elif not wants_login and action == "book":
-                # Login toggle is off but booking still needs auth. Re-probe
-                # one more time after navigating to /login, in case the
-                # initial homepage load happened too early and missed the
-                # auth cookies.
+        else:
+            # Sign-in toggle is OFF. Probe the existing session.
+            already = await self._probe_existing_session(page, context)
+            result_data["logged_in"] = already
+            if not already and action == "book":
+                await context.emit_event(
+                    "booking requires authentication but sign-in is off - manual login",
+                    level=WorkflowEventLevel.WARN,
+                )
                 try:
                     await page.goto(_LOGIN_URL, wait_until="domcontentloaded")
-                    await context.sync.wait_for_page_ready(page)
                 except Exception:  # noqa: BLE001
                     pass
-                if await self._is_signed_in(page):
-                    await context.emit_event(
-                        "session detected on /login - skipping manual login"
-                    )
-                    result_data["logged_in"] = True
-                else:
-                    await context.emit_event(
-                        "login disabled but booking requires authentication, "
-                        "asking for manual sign-in",
-                        level=WorkflowEventLevel.WARN,
-                    )
-                    result_data["logged_in"] = await self._request_manual_login(
-                        page, context, "Login first toggle is off but booking requires auth"
-                    )
-            else:
-                # Search-only flows can run without authentication.
-                await context.emit_event("login skipped (search-only flow)")
+                result_data["logged_in"] = await self._request_manual_login(
+                    page, context, "sign-in toggle off but booking requires auth"
+                )
 
         if action == "login":
             return PluginExecutionResult(
@@ -517,12 +514,16 @@ class TiketComPlugin(AutomationPlugin):
         )
 
     async def _is_signed_in(self, page: Page) -> bool:
-        """Check whether the active page reflects an authenticated session.
+        """Strictly check whether the active page reflects an authenticated
+        session.
 
-        Combines positive DOM signals (profile menu / 'My order' link), a
-        cookie probe (auth tokens always present after login), and a
-        negative check (Masuk / Sign in / Daftar buttons disappear when
-        logged in). Any single positive signal is sufficient.
+        Only POSITIVE evidence counts:
+          - a visible profile-menu / account DOM element, OR
+          - a strong authentication cookie with a non-empty value.
+
+        We deliberately do NOT infer "signed in" from the mere absence of a
+        login button - that produced false positives that skipped the login
+        flow when the user had explicitly requested it.
         """
 
         positive_selectors = (
@@ -546,59 +547,33 @@ class TiketComPlugin(AutomationPlugin):
             except Exception:  # noqa: BLE001
                 continue
 
-        # Cookie-based fallback: tiket.com sets long-lived auth cookies after
-        # sign-in (uid, ssotkn, accessToken, etc.). Their presence with a
-        # non-empty value is a strong indicator of an authenticated session.
+        # Strong auth-cookie probe. Use EXACT cookie-name matches so generic
+        # anonymous cookies (deviceuid, guid, _ga, ...) never trigger a false
+        # positive.
         try:
             cookies = await page.context.cookies()
         except Exception:  # noqa: BLE001
             cookies = []
-        auth_cookie_names = {
-            "uid",
+        strong_auth_cookies = {
             "ssotkn",
-            "accessToken",
+            "accesstoken",
             "access_token",
             "blibliticket-jwt",
-            "tiket_uid",
             "tiket_session",
             "tiket-session-id",
+            "islogin",
+            "is_login",
         }
         for cookie in cookies:
             try:
                 name = str(cookie.get("name", "")).lower()
-                value = str(cookie.get("value", ""))
+                value = str(cookie.get("value", "")).strip()
             except Exception:  # noqa: BLE001
                 continue
-            if value and any(known in name for known in auth_cookie_names):
+            if not value or value.lower() in {"false", "0", "null"}:
+                continue
+            if name in strong_auth_cookies:
                 return True
-
-        # Negative-signal check: 'Masuk' / 'Sign in' / 'Daftar' buttons only
-        # appear in the header for anonymous sessions, so their absence on a
-        # fully-loaded page implies an authenticated session.
-        anonymous_selectors = (
-            "header :text('Masuk')",
-            "header :text('Sign in')",
-            "header :text('Log in')",
-            "header :text('Daftar')",
-            "header :text('Register')",
-            "[data-testid*='loginButton' i]",
-            "[data-testid*='signInButton' i]",
-        )
-        any_anonymous = False
-        for selector in anonymous_selectors:
-            try:
-                if await page.locator(selector).first.is_visible(timeout=400):
-                    any_anonymous = True
-                    break
-            except Exception:  # noqa: BLE001
-                continue
-        if not any_anonymous:
-            # Page fully loaded but no login UI - treat as signed in.
-            try:
-                if await page.locator("header").first.is_visible(timeout=400):
-                    return True
-            except Exception:  # noqa: BLE001
-                return False
         return False
 
     async def _probe_existing_session(self, page: Page, context: PluginContext) -> bool:
@@ -857,6 +832,12 @@ class TiketComPlugin(AutomationPlugin):
                 url=page.url,
             )
 
+        # If a waiting room / queue appears after clicking buy, actively wait
+        # in line — tracking position — until it releases us. This must run
+        # BEFORE we look for packages, since the package list only renders
+        # once the queue clears.
+        await self._wait_through_queue(page, context, params, result_data)
+
         # The buy CTA navigates to the /packages sub-page.  Wait for that
         # navigation to settle before we start looking for Pilih buttons.
         try:
@@ -1071,6 +1052,155 @@ class TiketComPlugin(AutomationPlugin):
         if secs and not days:
             parts.append(f"{secs}s")
         return " ".join(parts) or f"{seconds}s"
+
+    async def _wait_through_queue(
+        self,
+        page: Page,
+        context: PluginContext,
+        params: dict[str, Any],
+        result_data: dict[str, Any],
+    ) -> None:
+        """Actively wait inside a waiting room / queue until released.
+
+        Tracks the queue position so the operator can see progress, keeps the
+        page alive (no premature close), and returns as soon as the queue
+        clears so package selection can proceed. Honors a max-wait budget;
+        beyond it, pauses for manual handling rather than failing.
+
+        Parameters (from the job):
+          - ``queue_wait``            bool, default True
+          - ``queue_max_wait_minutes`` int, default 60
+        """
+
+        detector = QueueDetector()
+        status = await detector.detect(page)
+        if not status.in_queue:
+            return
+
+        wait_enabled = bool(params.get("queue_wait", True))
+        max_wait_minutes = max(1, int(params.get("queue_max_wait_minutes", 60)))
+        max_wait_seconds = max_wait_minutes * 60
+
+        await context.emit_event(
+            f"waiting room detected - position={status.position or 'unknown'} "
+            f"detail={status.detail[:120]}",
+            level=WorkflowEventLevel.WARN,
+            context={
+                "position": status.position,
+                "estimated_wait_seconds": status.estimated_wait_seconds,
+                "url": status.url,
+            },
+        )
+        result_data["queue"] = {
+            "entered": True,
+            "initial_position": status.position,
+            "url": status.url,
+        }
+
+        if not wait_enabled:
+            await context.request_human(
+                f"Waiting room detected (position {status.position or 'unknown'}). "
+                "Wait for the queue to release, then click 'I'm done - resume'.",
+                url=status.url,
+            )
+            return
+
+        await self._notify_queue(context, status, first=True)
+
+        start = asyncio.get_event_loop().time()
+        last_position: int | None = status.position
+        last_progress_emit = 0.0
+        stagnant_since = start
+
+        while True:
+            if context.is_aborted():
+                raise HumanInterventionRequired("workflow aborted while in queue")
+
+            elapsed = asyncio.get_event_loop().time() - start
+            if elapsed >= max_wait_seconds:
+                await context.emit_event(
+                    f"queue wait exceeded {max_wait_minutes} min budget - asking operator",
+                    level=WorkflowEventLevel.WARN,
+                )
+                await context.request_human(
+                    f"Still in the waiting room after {max_wait_minutes} minutes "
+                    f"(position {last_position or 'unknown'}). Resume when released.",
+                    url=page.url,
+                )
+                return
+
+            # Poll the queue state. Keep the tab active by reading the DOM.
+            current = await detector.detect(page)
+            if not current.in_queue:
+                await context.emit_event("queue cleared - proceeding to packages")
+                await self._notify_queue(context, current, cleared=True)
+                # Let the released page settle before the caller continues.
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=10_000)
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+
+            # Progress tracking.
+            now = asyncio.get_event_loop().time()
+            pos = current.position
+            if pos is not None and pos != last_position:
+                last_position = pos
+                stagnant_since = now
+                if (now - last_progress_emit) >= 5:
+                    last_progress_emit = now
+                    await context.emit_event(
+                        f"queue position: {pos}"
+                        + (
+                            f" (~{self._format_duration(current.estimated_wait_seconds)} left)"
+                            if current.estimated_wait_seconds
+                            else ""
+                        ),
+                        context={"position": pos},
+                    )
+            elif (now - last_progress_emit) >= 20:
+                # Periodic heartbeat even when position text is unparseable.
+                last_progress_emit = now
+                await context.emit_event(
+                    f"still in queue (position {last_position or 'unknown'}, "
+                    f"{self._format_duration(int(elapsed))} elapsed)",
+                    context={"position": last_position},
+                )
+
+            # Detect a frozen/stuck queue (no movement for a long time) and
+            # nudge: a light reload can recover a desynced queue-it widget
+            # WITHOUT losing the place (queue-it persists position in a cookie).
+            if (now - stagnant_since) >= 180:
+                stagnant_since = now
+                await context.emit_event(
+                    "queue appears stuck for 3 min - performing a safe refresh",
+                    level=WorkflowEventLevel.WARN,
+                )
+                try:
+                    await page.reload(wait_until="domcontentloaded")
+                except Exception:  # noqa: BLE001
+                    pass
+
+            await asyncio.sleep(3)
+
+    async def _notify_queue(
+        self,
+        context: PluginContext,
+        status: QueueStatus,
+        *,
+        first: bool = False,
+        cleared: bool = False,
+    ) -> None:
+        """Emit a queue-state event. The runner mirrors WARNING-level queue
+        events to desktop / Telegram / Discord channels."""
+
+        if cleared:
+            msg = "Queue cleared - automation is selecting your package now."
+        elif first:
+            msg = f"You are in the waiting room. Position: {status.position or 'unknown'}."
+        else:
+            msg = f"Queue position: {status.position or 'unknown'}."
+        await context.emit_event(msg, level=WorkflowEventLevel.WARN)
 
     async def _select_package_with_fallback(
         self,
