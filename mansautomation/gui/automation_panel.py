@@ -123,12 +123,16 @@ class AutomationPanel(QWidget):
         self._quantity_spin = QSpinBox()
         self._quantity_spin.setRange(1, 20)
         self._quantity_spin.setValue(1)
-        self._presale_wait = QCheckBox("Wait for pre-sale countdown to elapse")
+        self._presale_wait = QCheckBox("Wait for pre-sale countdown to elapse (auto-resume)")
         self._presale_wait.setChecked(True)
         self._presale_max = QSpinBox()
-        self._presale_max.setRange(1, 240)
+        self._presale_max.setRange(1, 1440)
         self._presale_max.setValue(30)
         self._presale_max.setSuffix(" min")
+        self._presale_max.setToolTip(
+            "Only used when the countdown can't be parsed. When the page shows a "
+            "countdown / start time, the workflow waits exactly until then (up to 24h)."
+        )
         self._queue_wait = QCheckBox("Wait in queue / waiting room")
         self._queue_wait.setChecked(True)
         self._queue_max = QSpinBox()

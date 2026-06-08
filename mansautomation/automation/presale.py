@@ -53,6 +53,12 @@ _DATE_TIME_ID_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 4b) "09 Juni 2026 (05:00)" - tiket.com renders the time in parentheses.
+_DATE_TIME_PAREN_RE = re.compile(
+    r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\s*\(\s*(\d{1,2})[.:](\d{2})\s*\)",
+    re.IGNORECASE,
+)
+
 _NOT_YET_KEYWORDS = (
     "penjualan dimulai",
     "tiket tersedia mulai",
@@ -118,27 +124,39 @@ class SaleStatusDetector:
     def _extract_snippet(text: str, keyword: str) -> str:
         idx = text.lower().find(keyword)
         if idx < 0:
-            return text[:240]
+            return text[:400]
         start = max(0, idx - 80)
-        end = min(len(text), idx + 240)
+        end = min(len(text), idx + 400)
         return text[start:end]
 
     @staticmethod
     def _parse_timing(snippet: str) -> tuple[int | None, str | None, str]:
-        # Try a "HH:MM:SS" or "MM:SS" countdown first.
+        # Prefer the absolute date+time when present - it is exact and not
+        # affected by a client-side countdown that may lag.
+        abs_seconds, abs_iso, abs_detail = SaleStatusDetector._parse_absolute(snippet)
+
+        # Try a "HH:MM:SS" countdown (e.g. "Beli tiket dalam 19:55:00").
+        # The live countdown is authoritative and timezone-independent, so it
+        # wins over the absolute date for the actual wait duration.
         match = _COUNTDOWN_HMS_RE.search(snippet)
         if match:
             h, m, s = (int(x) for x in match.groups())
-            return h * 3600 + m * 60 + s, None, f"countdown {match.group(0)}"
+            seconds = h * 3600 + m * 60 + s
+            return (
+                seconds,
+                abs_iso,
+                f"countdown {match.group(0)}" + (f" / {abs_detail}" if abs_detail else ""),
+            )
+
         match = _COUNTDOWN_MS_RE.search(snippet)
         if match:
             m, s = (int(x) for x in match.groups())
-            # Only treat as a countdown when it comes after a relevant verb.
             preceding = snippet.lower()[: match.start()]
             if any(v in preceding for v in ("dalam", "in", "sisa", "remaining")):
-                return m * 60 + s, None, f"countdown {match.group(0)}"
+                seconds = m * 60 + s
+                return (seconds, abs_iso, f"countdown {match.group(0)}")
 
-        # Try a human-friendly duration "X jam Y menit Z detik".
+        # Human-friendly duration "X jam Y menit Z detik".
         for h_match in _HUMAN_DURATION_RE.finditer(snippet):
             d, h, m, s = h_match.groups()
             if not any((d, h, m, s)):
@@ -150,29 +168,38 @@ class SaleStatusDetector:
                 + int(s or 0)
             )
             if seconds > 0:
-                return seconds, None, f"duration {h_match.group(0).strip()}"
+                return seconds, abs_iso, f"duration {h_match.group(0).strip()}"
 
-        # Try an absolute date+time "28 Mei 2026 13:00".
-        match = _DATE_TIME_ID_RE.search(snippet)
-        if match:
-            day_s, month_s, year_s, hour_s, minute_s = match.groups()
-            month = _ID_MONTHS.get(month_s.lower()) or _MONTHS_EN.get(month_s.lower())
-            if month is not None:
-                try:
-                    starts_local = datetime(
-                        int(year_s), month, int(day_s),
-                        int(hour_s), int(minute_s),
-                    )
-                except ValueError:
-                    return None, None, snippet[:200]
-                # Treat the page-rendered time as local; convert relative to
-                # 'now' assuming the same wall clock. Without a tz hint this
-                # is a best-effort approximation.
-                now = datetime.now()
-                seconds = max(0, int((starts_local - now).total_seconds()))
-                starts_at_iso = starts_local.replace(tzinfo=timezone.utc).isoformat()
-                return seconds, starts_at_iso, f"opens at {match.group(0)}"
+        # Fall back to the absolute date+time.
+        if abs_seconds is not None:
+            return abs_seconds, abs_iso, abs_detail
         return None, None, snippet[:200]
+
+    @staticmethod
+    def _parse_absolute(snippet: str) -> tuple[int | None, str | None, str]:
+        """Parse an absolute sale-open datetime from the snippet.
+
+        Handles both "28 Mei 2026 13:00" and "09 Juni 2026 (05:00)".
+        Returns (seconds_until_open, iso_timestamp, detail).
+        """
+
+        match = _DATE_TIME_PAREN_RE.search(snippet) or _DATE_TIME_ID_RE.search(snippet)
+        if not match:
+            return None, None, ""
+        day_s, month_s, year_s, hour_s, minute_s = match.groups()
+        month = _ID_MONTHS.get(month_s.lower()) or _MONTHS_EN.get(month_s.lower())
+        if month is None:
+            return None, None, ""
+        try:
+            starts_local = datetime(
+                int(year_s), month, int(day_s), int(hour_s), int(minute_s)
+            )
+        except ValueError:
+            return None, None, ""
+        now = datetime.now()
+        seconds = max(0, int((starts_local - now).total_seconds()))
+        starts_at_iso = starts_local.replace(tzinfo=timezone.utc).isoformat()
+        return seconds, starts_at_iso, f"opens at {match.group(0).strip()}"
 
 
 _MONTHS_EN: dict[str, int] = {

@@ -969,7 +969,18 @@ class TiketComPlugin(AutomationPlugin):
         params: dict[str, Any],
         result_data: dict[str, Any],
     ) -> SaleStatus:
-        """Detect a pre-sale countdown and either wait it out or notify."""
+        """Detect a pre-sale countdown and either wait it out or notify.
+
+        Behaviour (controlled by job params):
+          - ``presale_wait``            bool, default True
+          - ``presale_max_wait_minutes`` int, default 30
+
+        When ``presale_wait`` is on AND a concrete open time / countdown was
+        parsed, we wait the FULL duration (capped at a 24h safety limit),
+        regardless of the minute budget, then auto-resume the moment the buy
+        button becomes clickable. The minute budget only governs the fallback
+        case where the countdown can't be parsed.
+        """
 
         detector = SaleStatusDetector()
         status = await detector.detect(page)
@@ -978,8 +989,10 @@ class TiketComPlugin(AutomationPlugin):
 
         wait_enabled = bool(params.get("presale_wait", True))
         max_wait_minutes = max(0, int(params.get("presale_max_wait_minutes", 30)))
+        hard_cap_seconds = 24 * 3600  # never wait longer than a day
+
         await context.emit_event(
-            "ticket sale is not yet open",
+            f"ticket sale not open yet - {status.detail}",
             level=WorkflowEventLevel.WARN,
             context={
                 "detail": status.detail,
@@ -997,76 +1010,193 @@ class TiketComPlugin(AutomationPlugin):
         if not wait_enabled:
             await context.request_human(
                 f"Tickets are not yet on sale. {status.detail}. "
-                "Resume the workflow when the sale opens.",
+                "Enable 'Pre-sale auto-wait' to wait automatically, or resume "
+                "manually once the sale opens.",
                 url=page.url,
             )
             return await detector.detect(page)
 
         seconds = status.seconds_until_open
         if seconds is None:
+            # Unknown countdown: fall back to the minute budget, then ask.
+            budget = max_wait_minutes * 60
+            if budget <= 0:
+                await context.request_human(
+                    f"Tickets not on sale and the countdown is unreadable. "
+                    f"{status.detail}. Resume when ready.",
+                    url=page.url,
+                )
+                return await detector.detect(page)
+            return await self._wait_for_sale_to_open(page, context, status, budget)
+
+        if seconds > hard_cap_seconds:
             await context.request_human(
-                f"Tickets are not yet on sale and the countdown could not be parsed. "
-                f"{status.detail}. Resume when ready.",
+                f"Tickets open in {self._format_duration(seconds)} ({status.detail}) - "
+                "that is more than 24 hours away. Resume closer to the sale time.",
                 url=page.url,
             )
             return await detector.detect(page)
 
-        max_wait_seconds = max_wait_minutes * 60
-        if seconds > max_wait_seconds:
-            await context.request_human(
-                f"Tickets open in {self._format_duration(seconds)} ({status.detail}). "
-                f"That is longer than the {max_wait_minutes}-minute auto-wait budget. "
-                "Resume the workflow when ready.",
-                url=page.url,
-            )
-            return await detector.detect(page)
-
-        return await self._wait_for_sale_to_open(page, context, status)
+        await context.emit_event(
+            f"auto-waiting {self._format_duration(seconds)} until sale opens "
+            f"({status.detail})",
+        )
+        # Wait the full parsed duration (+ a 2-minute safety tail to absorb
+        # countdown drift) and auto-resume when the buy button is ready.
+        return await self._wait_for_sale_to_open(
+            page, context, status, seconds + 120
+        )
 
     async def _wait_for_sale_to_open(
         self,
         page: Page,
         context: PluginContext,
         status: SaleStatus,
+        budget_seconds: int,
     ) -> SaleStatus:
+        """Efficiently wait until the sale opens, then auto-resume.
+
+        Two phases:
+          - FAR  (> 90s remaining): sleep in coarse chunks and reload the page
+            every ~2 minutes so the client-side countdown stays fresh. Emits a
+            progress line about once a minute. Low CPU, keeps the tab alive.
+          - NEAR (<= 90s remaining): reload once, then poll every second for
+            the buy button to flip from the disabled "Beli tiket dalam ..."
+            state to an enabled CTA. Returns the instant it is clickable so
+            the caller clicks it immediately at the exact open moment.
+        """
+
         detector = SaleStatusDetector()
-        seconds_remaining = status.seconds_until_open or 0
-        await context.emit_event(
-            "waiting for sale to open",
-            context={
-                "seconds_remaining": seconds_remaining,
-                "detail": status.detail,
-            },
-        )
-        deadline = max(seconds_remaining, 0) + 60  # small buffer
-        elapsed = 0
-        last_emit = 0
-        while elapsed < deadline:
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        deadline = start + max(5, budget_seconds)
+        last_progress = 0.0
+        last_reload = start
+
+        while loop.time() < deadline:
             if context.is_aborted():
                 raise HumanInterventionRequired("workflow aborted while waiting for sale")
+
             current = await detector.detect(page)
-            if current.is_open:
-                await context.emit_event("sale is now open")
-                return current
+
+            # Open signals: detector says open OR the buy button is clickable.
+            if current.is_open or await self._is_buy_button_ready(page):
+                await context.emit_event("sale is now open - resuming automatically")
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=8_000)
+                except Exception:  # noqa: BLE001
+                    pass
+                return SaleStatus(is_open=True, detail="sale opened", url=page.url)
+
             remaining = current.seconds_until_open
-            if remaining is not None and (elapsed - last_emit) >= 30:
-                last_emit = elapsed
+            now = loop.time()
+
+            if remaining is not None and remaining <= 90:
+                # NEAR phase: reload once to surface the live CTA, then poll
+                # tightly until the button is ready.
+                try:
+                    await page.reload(wait_until="domcontentloaded")
+                    await context.sync.wait_for_dom_settle(page, quiet_ms=200, timeout_ms=2_000)
+                except Exception:  # noqa: BLE001
+                    pass
+                tight_deadline = now + max(remaining + 30, 60)
                 await context.emit_event(
-                    "sale countdown progress",
-                    context={
-                        "seconds_remaining": remaining,
-                        "detail": current.detail,
-                    },
+                    f"sale opens in ~{self._format_duration(remaining)} - polling for the buy button"
                 )
-            sleep_s = min(15, max(2, (remaining or 15) // 4))
-            await asyncio.sleep(sleep_s)
-            elapsed += sleep_s
-            try:
-                await page.reload(wait_until="domcontentloaded")
-                await context.sync.wait_for_page_ready(page)
-            except Exception:  # noqa: BLE001
+                while loop.time() < tight_deadline:
+                    if context.is_aborted():
+                        raise HumanInterventionRequired("workflow aborted while waiting for sale")
+                    if await self._is_buy_button_ready(page):
+                        await context.emit_event("buy button is live - resuming")
+                        return SaleStatus(is_open=True, detail="sale opened", url=page.url)
+                    refreshed = await detector.detect(page)
+                    if refreshed.is_open:
+                        return SaleStatus(is_open=True, detail="sale opened", url=page.url)
+                    await asyncio.sleep(1)
+                    # Reload every ~10s in the tight phase so a stale countdown
+                    # widget can't keep the page disabled past the open time.
+                    if int(loop.time()) % 10 == 0:
+                        try:
+                            await page.reload(wait_until="domcontentloaded")
+                        except Exception:  # noqa: BLE001
+                            pass
+                # Tight window elapsed without the button going live - loop
+                # again (a fresh detect will recompute remaining).
                 continue
+
+            # FAR phase: progress heartbeat ~ once a minute.
+            if (now - last_progress) >= 60:
+                last_progress = now
+                shown = remaining if remaining is not None else int(deadline - now)
+                await context.emit_event(
+                    f"waiting for sale to open - ~{self._format_duration(int(shown))} left"
+                    + (f" ({current.starts_at})" if current.starts_at else "")
+                )
+
+            # Coarse sleep, sized to the remaining time but capped.
+            sleep_s = 30
+            if remaining is not None:
+                sleep_s = max(10, min(60, remaining // 4))
+            await asyncio.sleep(sleep_s)
+
+            # Reload every ~2 minutes during the far phase to refresh the
+            # client-side countdown / session.
+            if (loop.time() - last_reload) >= 120:
+                last_reload = loop.time()
+                try:
+                    await page.reload(wait_until="domcontentloaded")
+                    await context.sync.wait_for_dom_settle(page, quiet_ms=250, timeout_ms=2_500)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # Budget exhausted - final check then hand back to the operator.
+        final = await detector.detect(page)
+        if final.is_open or await self._is_buy_button_ready(page):
+            return SaleStatus(is_open=True, detail="sale opened", url=page.url)
+        await context.request_human(
+            f"Sale has not opened within the wait window ({final.detail}). "
+            "Resume when the buy button is live.",
+            url=page.url,
+        )
         return await detector.detect(page)
+
+    async def _is_buy_button_ready(self, page: Page) -> bool:
+        """Return True when an enabled buy CTA is present.
+
+        Distinguishes the disabled pre-sale countdown button
+        ("Beli tiket dalam HH:MM:SS") from the live, clickable
+        "Beli tiket sekarang" CTA.
+        """
+
+        try:
+            return bool(
+                await page.evaluate(
+                    r"""() => {
+                        const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                        const nodes = [
+                            ...document.querySelectorAll('button'),
+                            ...document.querySelectorAll('[role="button"]'),
+                            ...document.querySelectorAll('a'),
+                        ];
+                        for (const el of nodes) {
+                            const t = norm(el.innerText);
+                            if (!t) continue;
+                            // Must look like a buy CTA.
+                            if (!/(beli tiket|buy ticket|pesan tiket|beli sekarang)/.test(t)) continue;
+                            // Disabled pre-sale countdown -> not ready.
+                            if (/\bdalam\b|\bin\b/.test(t) && /\d{1,2}:\d{2}/.test(t)) continue;
+                            if (el.disabled) continue;
+                            if (el.getAttribute('aria-disabled') === 'true') continue;
+                            // A visible, enabled buy CTA.
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) return true;
+                        }
+                        return false;
+                    }"""
+                )
+            )
+        except Exception:  # noqa: BLE001
+            return False
 
     @staticmethod
     def _format_duration(seconds: int) -> str:
