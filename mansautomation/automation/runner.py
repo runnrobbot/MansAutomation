@@ -22,10 +22,7 @@ from mansautomation.automation.interactions import (
     DEFAULT_LOADING_SELECTORS,
     wait_for_disappear,
 )
-from mansautomation.automation.resilience import (
-    HeartbeatWatchdog,
-    QueueStateWatcher,
-)
+from mansautomation.automation.resilience import HeartbeatWatchdog
 from mansautomation.automation.sync import (
     wait_for_dom_settle,
     wait_for_network_quiet,
@@ -280,7 +277,15 @@ class WorkflowRunner:
     async def _start_resilience_watchers(
         self, page: Page, job: WorkflowJob
     ) -> list[Any]:
-        """Attach heartbeat + queue watchers and forward their events."""
+        """Attach the heartbeat watchdog and forward its events.
+
+        Only a lightweight, read-only liveness watchdog runs here. Queue /
+        waiting-room progression is tracked authoritatively by the plugin's
+        ``_wait_through_queue`` (which reads queue-it's embedded JSON), so we
+        deliberately do not run a second text-scraping queue watcher - that
+        would only add page load and emit confusing "queue reconnected" noise
+        during a high-traffic sale.
+        """
 
         async def _emit(name: str, payload: dict[str, Any]) -> None:
             await self._publish_event(
@@ -290,7 +295,7 @@ class WorkflowRunner:
                 status=WorkflowStatus.RUNNING,
                 context={"event": name, **payload},
             )
-            if name == "queue_regressed" or name == "queue_frozen" or name == "heartbeat_unhealthy":
+            if name == "heartbeat_unhealthy":
                 await self._notifications.dispatch(
                     Notification(
                         title="Workflow alert",
@@ -300,10 +305,8 @@ class WorkflowRunner:
                 )
 
         heartbeat = HeartbeatWatchdog(page, _emit)
-        queue = QueueStateWatcher(page, _emit)
         await heartbeat.start()
-        await queue.start()
-        return [heartbeat, queue]
+        return [heartbeat]
 
     async def _stop_resilience_watchers(self, watchers: list[Any]) -> None:
         for watcher in watchers:
@@ -498,6 +501,6 @@ def _status_to_level(status: WorkflowStatus) -> NotificationLevel:
 
 
 def _resilience_level(event_name: str) -> WorkflowEventLevel:
-    if event_name in {"queue_regressed", "queue_frozen", "heartbeat_unhealthy", "session_lost"}:
+    if event_name == "heartbeat_unhealthy":
         return WorkflowEventLevel.WARN
     return WorkflowEventLevel.INFO

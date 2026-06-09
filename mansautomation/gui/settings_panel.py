@@ -190,22 +190,6 @@ class SettingsPanel(QWidget):
             make_form_row(form, label, widget)
         return group
 
-    def _build_logging_group(self) -> QGroupBox:
-        group = QGroupBox("Logging")
-        form = QFormLayout(group)
-        configure_form(form)
-        self._log_level = QComboBox()
-        self._log_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
-        self._log_json = QCheckBox("Emit JSON logs (machine-readable)")
-        self._log_to_file = QCheckBox("Write logs to file (rotating)")
-        for label, widget in (
-            ("Log level", self._log_level),
-            ("JSON logs", self._log_json),
-            ("Log to file", self._log_to_file),
-        ):
-            make_form_row(form, label, widget)
-        return group
-
     def _load_values(self) -> None:
         b = self._settings.browser
         idx = self._engine.findText(b.engine)

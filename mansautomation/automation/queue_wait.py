@@ -86,6 +86,12 @@ class QueueStatus:
     seconds_to_start: int | None = None
     event_start_utc: str | None = None
     estimated_wait_seconds: int | None = None
+    expected_service: str | None = None
+    serviced_soon: bool = False
+    redirect_prompt: bool = False
+    connection_lost: bool = False
+    queue_paused: bool = False
+    challenge: bool = False
     is_queueit: bool = False
     detail: str = ""
     url: str = ""
@@ -107,7 +113,8 @@ class QueueStatus:
 
 
 # JS that extracts queue-it's embedded model from the live page. Reads the
-# knockout view model first, then falls back to regex over the page HTML.
+# rendered DOM spans first (most reliable on the live queue page), then the
+# knockout view model, then a regex over the embedded JSON.
 _QUEUEIT_EXTRACT_JS = r"""() => {
     const out = { isQueueit: false };
     const html = document.documentElement ? document.documentElement.innerHTML : '';
@@ -115,7 +122,8 @@ _QUEUEIT_EXTRACT_JS = r"""() => {
     const looksQueueit =
         !!document.getElementById('queue-it_log') ||
         !!window.queueViewModel ||
-        /queue-it\.net|queue\.tiket\.com/i.test(html.slice(0, 8000)) ||
+        !!document.getElementById('MainPart_lbQueueNumber') ||
+        /queue-it\.net|queue\.tiket\.com/i.test(html.slice(0, 12000)) ||
         (document.body && /\b(before|queue)\b/.test(document.body.className || ''));
     if (!looksQueueit) return out;
     out.isQueueit = true;
@@ -125,39 +133,90 @@ _QUEUEIT_EXTRACT_JS = r"""() => {
     else if (/\bbefore\b/.test(cls)) out.phase = 'before';
     else out.phase = 'unknown';
 
-    const read = (f) => {
-        try { return (typeof f === 'function') ? f() : f; } catch (e) { return null; }
+    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+    const txt = (id) => {
+        const el = document.getElementById(id);
+        return el ? norm(el.innerText) : null;
     };
 
-    // 1) Live knockout view model (authoritative, updates every 30s).
+    // 1) Rendered DOM spans (knockout has already bound the live values).
+    out.queueNumber = txt('MainPart_lbQueueNumber');
+    out.usersAhead = txt('MainPart_lbUsersInLineAheadOfYou');
+    out.expectedService = txt('MainPart_lbExpectedServiceTime');
+    const countdownTxt = txt('defaultCountdown');
+    if (countdownTxt) out.countdownText = countdownTxt;
+
+    // 2) Live knockout view model (authoritative, updates every cycle).
+    const read = (f) => { try { return (typeof f === 'function') ? f() : f; } catch (e) { return null; } };
     try {
         const vm = window.queueViewModel;
         if (vm && vm.ticket) {
             const t = vm.ticket;
-            out.queueNumber = read(t.queueNumber);
-            out.usersAhead = read(t.usersInLineAheadOfYou);
+            out.queueNumber = out.queueNumber || read(t.queueNumber);
+            out.usersAhead = out.usersAhead || read(t.usersInLineAheadOfYou);
             out.secondsToStart = read(t.secondsToStart);
             out.eventStartUTC = read(t.eventStartTimeUTC);
+            out.expectedService = out.expectedService || read(t.expectedServiceTime);
         }
     } catch (e) {}
 
-    // 2) Regex fallback over the embedded inqueueInfo JSON.
-    if (out.eventStartUTC == null) {
-        const m = html.match(/"eventStartTimeUTC"\s*:\s*"([^"]+)"/);
-        if (m) out.eventStartUTC = m[1];
-    }
+    // 3) Regex fallback over the embedded inqueueInfo JSON.
+    const grab = (key) => {
+        const m = html.match(new RegExp('"' + key + '"\\s*:\\s*"?([^",}]+)"?'));
+        return m ? m[1] : null;
+    };
+    if (out.eventStartUTC == null) out.eventStartUTC = grab('eventStartTimeUTC');
     if (out.secondsToStart == null) {
         const s = html.match(/"secondsToStart"\s*:\s*(\d+)/);
         if (s) out.secondsToStart = parseInt(s[1], 10);
     }
-    if (out.queueNumber == null) {
-        const q = html.match(/"queueNumber"\s*:\s*"?([^",}]+)"?/);
-        if (q) out.queueNumber = q[1];
+    if (!out.queueNumber || /calculating/i.test(String(out.queueNumber))) {
+        out.queueNumber = grab('queueNumber') || out.queueNumber;
     }
-    if (out.usersAhead == null) {
-        const u = html.match(/"usersInLineAheadOfYou"\s*:\s*"?([^",}]+)"?/);
-        if (u) out.usersAhead = u[1];
+    if (!out.usersAhead || /calculating/i.test(String(out.usersAhead))) {
+        out.usersAhead = grab('usersInLineAheadOfYou') || out.usersAhead;
     }
+
+    // 4) Visibility helper - handles display:none, zero-size, and knockout
+    //    toggles. queue-it pre-renders all state elements and only shows the
+    //    relevant ones, so we must check actual visibility, not presence.
+    const isShown = (el) => {
+        if (!el) return false;
+        const st = window.getComputedStyle(el);
+        if (st.display === 'none' || st.visibility === 'hidden') return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 1 && r.height > 1;
+    };
+
+    // 5) "It is your turn" / redirect signals.
+    out.firstInLine = isShown(document.getElementById('first-in-line'));
+    out.servicedSoon = isShown(document.getElementById('serviced-soon'));
+
+    // 6) Redirect-confirm dialog: some events require an explicit click on
+    //    "Yes, please" to proceed to the site when your turn arrives. Surface
+    //    it so the caller can click the legitimate proceed button (no bypass).
+    out.redirectPrompt = isShown(document.getElementById('divConfirmRedirectModal'));
+
+    // 7) Connection lost / queue paused (informational guards).
+    out.connectionLost = isShown(document.getElementById('MainPart_lbManualUpdateWarning'));
+    out.queuePaused = isShown(document.getElementById('queue-paused'));
+
+    // 8) Interactive CAPTCHA challenge that genuinely needs a human. queue-it
+    //    solves its ProofOfWork challenge itself; only image/checkbox
+    //    challenges (reCaptcha bframe / hCaptcha) block and need a person.
+    out.challenge = false;
+    const cSel = [
+        'iframe[src*="recaptcha/api2/bframe"]',
+        'iframe[src*="hcaptcha.com"][src*="frame=challenge"]',
+    ];
+    for (const s of cSel) {
+        const el = document.querySelector(s);
+        if (isShown(el)) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 100 && r.height > 100) { out.challenge = true; break; }
+        }
+    }
+
     return out;
 }"""
 
@@ -200,6 +259,12 @@ class QueueDetector:
                 users_ahead=_to_int(qi.get("usersAhead")),
                 seconds_to_start=_to_int(qi.get("secondsToStart")),
                 event_start_utc=(str(qi["eventStartUTC"]) if qi.get("eventStartUTC") else None),
+                expected_service=(str(qi["expectedService"]) if qi.get("expectedService") else None),
+                serviced_soon=bool(qi.get("servicedSoon") or qi.get("firstInLine")),
+                redirect_prompt=bool(qi.get("redirectPrompt")),
+                connection_lost=bool(qi.get("connectionLost")),
+                queue_paused=bool(qi.get("queuePaused")),
+                challenge=bool(qi.get("challenge")),
                 is_queueit=True,
                 detail=(
                     "queue-it pre-queue (sale not started)"

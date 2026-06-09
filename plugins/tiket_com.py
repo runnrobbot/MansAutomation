@@ -25,7 +25,7 @@ import re
 from typing import Any
 from urllib.parse import quote_plus
 
-from playwright.async_api import Locator, Page, TimeoutError as PlaywrightTimeout
+from playwright.async_api import Locator, Page
 from rapidfuzz import fuzz
 
 from mansautomation.automation.human_intervention import HumanInterventionDetector
@@ -1359,6 +1359,14 @@ class TiketComPlugin(AutomationPlugin):
         start = loop.time()
         last_emit = 0.0
         last_position: int | None = status.position
+        # Monotonic time at which our clock first crossed the sale start while
+        # the page was still on the pre-queue screen. Used only to detect a
+        # genuinely stuck / throttled tab as a last resort (see below).
+        zero_crossed_at: float | None = None
+        # Monotonic time the "lost connection to the line" warning first showed.
+        conn_lost_at: float | None = None
+        # Whether we've announced the aggressive final-stretch polling.
+        final_stretch_announced = False
 
         while True:
             if context.is_aborted():
@@ -1373,47 +1381,180 @@ class TiketComPlugin(AutomationPlugin):
 
             current = await detector.detect(page)
 
-            # Released: no longer a waiting room => proceed.
+            # Released: no longer a waiting room => proceed. But a single
+            # "not in queue" reading can be a transient blank during queue-it's
+            # own transition navigation (before -> queue, or queue -> site), so
+            # confirm with a short re-check before trusting it.
             if not current.in_queue:
-                await context.emit_event("queue released - proceeding")
                 try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=10_000)
+                    await page.wait_for_load_state("domcontentloaded", timeout=8_000)
                 except Exception:  # noqa: BLE001
                     pass
-                return
+                await asyncio.sleep(0.5)
+                confirm = await detector.detect(page)
+                if confirm.in_queue:
+                    current = confirm
+                else:
+                    await context.emit_event("queue released - proceeding")
+                    return
 
             now = loop.time()
 
-            if current.phase == "before":
-                # Pre-queue: exact countdown from the absolute UTC timestamp.
-                secs = current.seconds_until_start_now()
-                if secs is not None and secs <= 2:
-                    # Sale time reached - the queue-it page refreshes itself
-                    # into the live queue. Nudge a reload to be safe.
-                    await context.emit_event("sale time reached - entering live queue")
+            # --- Cross-phase guards (highest priority first) ---------------
+
+            # 1) Interactive CAPTCHA / verification challenge: never bypass.
+            #    Pause for the human; queue-it keeps the place in line, so it
+            #    resumes from where it was once solved.
+            if current.challenge:
+                await context.emit_event(
+                    "queue-it verification challenge detected - needs manual solving",
+                    level=WorkflowEventLevel.WARN,
+                )
+                await context.request_human(
+                    "A verification challenge (CAPTCHA) appeared in the waiting "
+                    "room. Solve it in the browser window - your place in line is "
+                    "kept and waiting continues automatically afterwards.",
+                    url=page.url,
+                )
+                if context.is_aborted():
+                    raise HumanInterventionRequired("aborted during queue challenge")
+                await asyncio.sleep(2)
+                continue
+
+            # 2) Redirect-confirm dialog ("Your turn started... Yes, please").
+            #    Click the legitimate proceed button so we don't hang at the
+            #    finish line on events that require the confirmation click.
+            if current.redirect_prompt:
+                await context.emit_event("it's your turn - confirming redirect to the site")
+                try:
+                    await page.click("#buttonConfirmRedirect", timeout=5_000)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(2)
+                continue
+
+            # 3) Lost connection to the line. queue-it stops updating but the
+            #    place is preserved by cookie, so a reload reconnects safely.
+            #    Only reload if it persists, to avoid needless churn.
+            if current.connection_lost:
+                if conn_lost_at is None:
+                    conn_lost_at = now
+                    await context.emit_event(
+                        "lost connection to the line - waiting to reconnect",
+                        level=WorkflowEventLevel.WARN,
+                    )
+                elif (now - conn_lost_at) >= 20:
+                    conn_lost_at = now
+                    await context.emit_event(
+                        "reconnecting to the line (reload - place is preserved)",
+                        level=WorkflowEventLevel.WARN,
+                    )
                     try:
                         await page.reload(wait_until="domcontentloaded")
                     except Exception:  # noqa: BLE001
                         pass
-                    await asyncio.sleep(2)
-                    continue
-                if (now - last_emit) >= 30:
+                await asyncio.sleep(3)
+                continue
+            conn_lost_at = None
+
+            if current.phase == "before":
+                # Pre-queue countdown. queue-it's OWN JavaScript polls its
+                # server and, at the exact sale moment, redirects this page
+                # into the live queue. THAT automatic redirect is what assigns
+                # your queue position, so we must NOT reload or navigate here:
+                # a manual reload aborts queue-it's in-flight transition and
+                # re-joins you a few seconds late, landing you tens of
+                # thousands of places further back. We only watch (read-only)
+                # and let queue-it move us.
+                secs = current.seconds_until_start_now()
+
+                # Announce the final stretch once, then poll harder so the
+                # operator can see the system is armed and ready.
+                if secs is not None and secs <= 60 and not final_stretch_announced:
+                    final_stretch_announced = True
+                    await context.emit_event(
+                        "final stretch - arming aggressive polling to enter the "
+                        "queue the instant the sale opens",
+                        level=WorkflowEventLevel.WARN,
+                    )
+
+                emit_gap = 10 if (secs is not None and secs <= 60) else 30
+                if (now - last_emit) >= emit_gap:
                     last_emit = now
                     await context.emit_event(
                         f"waiting for sale - {self._format_duration(secs) if secs is not None else 'unknown'} left",
                         context={"seconds_left": secs},
                     )
-                # Near the start, poll tightly; far away, poll coarsely.
-                if secs is not None and secs <= 90:
+
+                if secs is not None and secs <= 0:
+                    # Sale time has arrived per queue-it's authoritative
+                    # timestamp. Hold tight and keep polling fast - queue-it
+                    # redirects itself within a few seconds. Do NOT touch the
+                    # page; the next detect() will pick up phase='queue'.
+                    if zero_crossed_at is None:
+                        zero_crossed_at = now
+                        await context.emit_event(
+                            "sale time reached - holding for queue-it to release "
+                            "(no reload, to keep the best queue position)"
+                        )
+                    elif (now - zero_crossed_at) >= 60:
+                        # 60s past sale start and still on the pre-queue page:
+                        # the tab is likely frozen / throttled and queue-it's
+                        # auto-redirect never fired. Nudge a single reload as a
+                        # last resort, then give it another 60s window.
+                        zero_crossed_at = now
+                        await context.emit_event(
+                            "queue-it has not redirected after 60s - refreshing once",
+                            level=WorkflowEventLevel.WARN,
+                        )
+                        try:
+                            await page.reload(wait_until="domcontentloaded")
+                        except Exception:  # noqa: BLE001
+                            pass
+                    # Poll twice a second so the transition is caught instantly.
+                    await asyncio.sleep(0.5)
+                    continue
+
+                # Before T-0: reset the stuck-timer and poll progressively
+                # faster as the sale approaches. Catching queue-it's transition
+                # with no wasted time gives the best position queue-it allows.
+                # These are read-only DOM reads, so tight polling is safe and
+                # does not destabilise the page.
+                zero_crossed_at = None
+                if secs is None:
+                    await asyncio.sleep(2)
+                elif secs <= 5:
+                    await asyncio.sleep(0.2)
+                elif secs <= 15:
+                    await asyncio.sleep(0.3)
+                elif secs <= 60:
+                    await asyncio.sleep(0.5)
+                elif secs <= 120:
                     await asyncio.sleep(1)
                 else:
-                    await asyncio.sleep(min(20, max(3, (secs or 30) // 6)))
+                    await asyncio.sleep(min(15, max(3, secs // 6)))
                 continue
 
-            # Live queue phase: track position, keep the tab alive.
+            # Live queue phase: track position, keep the tab alive. Poll
+            # gently - queue-it only refreshes its model every 30-40s, so
+            # hammering it adds load without new data and can destabilise the
+            # page under heavy traffic.
+            if current.serviced_soon:
+                await context.emit_event("it's your turn - being redirected to the site")
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(2)
+                continue
+
             pos = current.position
             ahead = current.users_ahead
-            if (now - last_emit) >= 10 or (pos is not None and pos != last_position):
+            if (now - last_emit) >= 15 or (pos is not None and pos != last_position):
                 last_emit = now
                 last_position = pos
                 parts = []
@@ -1421,12 +1562,16 @@ class TiketComPlugin(AutomationPlugin):
                     parts.append(f"number {pos}")
                 if ahead is not None:
                     parts.append(f"{ahead} ahead")
+                if current.expected_service:
+                    parts.append(f"est. {current.expected_service}")
+                if current.queue_paused:
+                    parts.append("line paused")
                 detail = ", ".join(parts) or "position calculating"
                 await context.emit_event(
                     f"in queue - {detail}",
                     context={"position": pos, "users_ahead": ahead},
                 )
-            await asyncio.sleep(3)
+            await asyncio.sleep(8)
 
 
     async def _select_package_with_fallback(
