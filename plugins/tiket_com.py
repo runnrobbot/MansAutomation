@@ -30,7 +30,7 @@ from rapidfuzz import fuzz
 
 from mansautomation.automation.human_intervention import HumanInterventionDetector
 from mansautomation.automation.presale import SaleStatus, SaleStatusDetector
-from mansautomation.automation.queue_wait import QueueDetector, QueueStatus
+from mansautomation.automation.queue_wait import QueueDetector
 from mansautomation.core.exceptions import HumanInterventionRequired
 from mansautomation.core.models import WorkflowEventLevel
 from mansautomation.plugins.base import (
@@ -886,6 +886,12 @@ class TiketComPlugin(AutomationPlugin):
             await page.goto(target["url"], wait_until="domcontentloaded")
 
         await self._await_human_when_needed(page, context)
+
+        # tiket.com can redirect straight into the queue-it waiting room the
+        # moment the event page is opened (especially during pre-sale). Handle
+        # any waiting room BEFORE looking for the hero CTA / pre-sale text.
+        await self._wait_through_queue(page, context, params, result_data)
+
         # Wait for the hero CTA to render rather than gambling on networkidle.
         try:
             await page.wait_for_selector(
@@ -1292,16 +1298,19 @@ class TiketComPlugin(AutomationPlugin):
         params: dict[str, Any],
         result_data: dict[str, Any],
     ) -> None:
-        """Actively wait inside a waiting room / queue until released.
+        """Actively wait through a queue-it waiting room until released.
 
-        Tracks the queue position so the operator can see progress, keeps the
-        page alive (no premature close), and returns as soon as the queue
-        clears so package selection can proceed. Honors a max-wait budget;
-        beyond it, pauses for manual handling rather than failing.
+        Handles two phases:
+          - ``before`` : pre-queue countdown to sale start. Uses the embedded
+            ``eventStartTimeUTC`` for an exact, drift-free countdown. The page
+            auto-refreshes itself and drops into the live queue at sale time.
+          - ``queue``  : the live queue. Tracks the queue number / users ahead
+            and waits until the session is released to the event/packages page.
 
-        Parameters (from the job):
-          - ``queue_wait``            bool, default True
-          - ``queue_max_wait_minutes`` int, default 60
+        Returns when the page is no longer a waiting room (released), so the
+        caller can proceed to buy / package selection. tiket.com may land
+        either on the event page (with a "Beli tiket" button) or directly on
+        the packages page - both are handled by the caller.
         """
 
         detector = QueueDetector()
@@ -1310,129 +1319,115 @@ class TiketComPlugin(AutomationPlugin):
             return
 
         wait_enabled = bool(params.get("queue_wait", True))
-        max_wait_minutes = max(1, int(params.get("queue_max_wait_minutes", 60)))
-        max_wait_seconds = max_wait_minutes * 60
+        # Pre-queue countdowns can be hours; allow a generous cap. The queue
+        # phase itself is usually minutes. Default cap = 24h safety.
+        max_wait_seconds = 24 * 3600
 
-        await context.emit_event(
-            f"waiting room detected - position={status.position or 'unknown'} "
-            f"detail={status.detail[:120]}",
-            level=WorkflowEventLevel.WARN,
-            context={
-                "position": status.position,
-                "estimated_wait_seconds": status.estimated_wait_seconds,
-                "url": status.url,
-            },
-        )
         result_data["queue"] = {
             "entered": True,
+            "phase": status.phase,
             "initial_position": status.position,
+            "event_start_utc": status.event_start_utc,
             "url": status.url,
         }
 
         if not wait_enabled:
             await context.request_human(
-                f"Waiting room detected (position {status.position or 'unknown'}). "
-                "Wait for the queue to release, then click 'I'm done - resume'.",
+                "A waiting room / queue was detected. Wait for it to release, "
+                "then click 'I'm done - resume'.",
                 url=status.url,
             )
             return
 
-        await self._notify_queue(context, status, first=True)
+        # Announce entry with the most precise info available.
+        if status.phase == "before":
+            secs = status.seconds_until_start_now()
+            await context.emit_event(
+                f"queue-it pre-queue detected - sale starts in "
+                f"{self._format_duration(secs) if secs is not None else 'unknown'}"
+                + (f" (at {status.event_start_utc} UTC)" if status.event_start_utc else ""),
+                level=WorkflowEventLevel.WARN,
+            )
+        else:
+            await context.emit_event(
+                f"queue detected - number={status.position or 'calculating'} "
+                f"ahead={status.users_ahead if status.users_ahead is not None else 'calculating'}",
+                level=WorkflowEventLevel.WARN,
+            )
 
-        start = asyncio.get_event_loop().time()
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        last_emit = 0.0
         last_position: int | None = status.position
-        last_progress_emit = 0.0
-        stagnant_since = start
 
         while True:
             if context.is_aborted():
                 raise HumanInterventionRequired("workflow aborted while in queue")
-
-            elapsed = asyncio.get_event_loop().time() - start
-            if elapsed >= max_wait_seconds:
-                await context.emit_event(
-                    f"queue wait exceeded {max_wait_minutes} min budget - asking operator",
-                    level=WorkflowEventLevel.WARN,
-                )
+            if (loop.time() - start) >= max_wait_seconds:
                 await context.request_human(
-                    f"Still in the waiting room after {max_wait_minutes} minutes "
-                    f"(position {last_position or 'unknown'}). Resume when released.",
+                    "Still waiting in the queue after the maximum wait window. "
+                    "Resume when released.",
                     url=page.url,
                 )
                 return
 
-            # Poll the queue state. Keep the tab active by reading the DOM.
             current = await detector.detect(page)
+
+            # Released: no longer a waiting room => proceed.
             if not current.in_queue:
-                await context.emit_event("queue cleared - proceeding to packages")
-                await self._notify_queue(context, current, cleared=True)
-                # Let the released page settle before the caller continues.
+                await context.emit_event("queue released - proceeding")
                 try:
                     await page.wait_for_load_state("domcontentloaded", timeout=10_000)
                 except Exception:  # noqa: BLE001
                     pass
                 return
 
-            # Progress tracking.
-            now = asyncio.get_event_loop().time()
-            pos = current.position
-            if pos is not None and pos != last_position:
-                last_position = pos
-                stagnant_since = now
-                if (now - last_progress_emit) >= 5:
-                    last_progress_emit = now
+            now = loop.time()
+
+            if current.phase == "before":
+                # Pre-queue: exact countdown from the absolute UTC timestamp.
+                secs = current.seconds_until_start_now()
+                if secs is not None and secs <= 2:
+                    # Sale time reached - the queue-it page refreshes itself
+                    # into the live queue. Nudge a reload to be safe.
+                    await context.emit_event("sale time reached - entering live queue")
+                    try:
+                        await page.reload(wait_until="domcontentloaded")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    await asyncio.sleep(2)
+                    continue
+                if (now - last_emit) >= 30:
+                    last_emit = now
                     await context.emit_event(
-                        f"queue position: {pos}"
-                        + (
-                            f" (~{self._format_duration(current.estimated_wait_seconds)} left)"
-                            if current.estimated_wait_seconds
-                            else ""
-                        ),
-                        context={"position": pos},
+                        f"waiting for sale - {self._format_duration(secs) if secs is not None else 'unknown'} left",
+                        context={"seconds_left": secs},
                     )
-            elif (now - last_progress_emit) >= 20:
-                # Periodic heartbeat even when position text is unparseable.
-                last_progress_emit = now
-                await context.emit_event(
-                    f"still in queue (position {last_position or 'unknown'}, "
-                    f"{self._format_duration(int(elapsed))} elapsed)",
-                    context={"position": last_position},
-                )
+                # Near the start, poll tightly; far away, poll coarsely.
+                if secs is not None and secs <= 90:
+                    await asyncio.sleep(1)
+                else:
+                    await asyncio.sleep(min(20, max(3, (secs or 30) // 6)))
+                continue
 
-            # Detect a frozen/stuck queue (no movement for a long time) and
-            # nudge: a light reload can recover a desynced queue-it widget
-            # WITHOUT losing the place (queue-it persists position in a cookie).
-            if (now - stagnant_since) >= 180:
-                stagnant_since = now
+            # Live queue phase: track position, keep the tab alive.
+            pos = current.position
+            ahead = current.users_ahead
+            if (now - last_emit) >= 10 or (pos is not None and pos != last_position):
+                last_emit = now
+                last_position = pos
+                parts = []
+                if pos is not None:
+                    parts.append(f"number {pos}")
+                if ahead is not None:
+                    parts.append(f"{ahead} ahead")
+                detail = ", ".join(parts) or "position calculating"
                 await context.emit_event(
-                    "queue appears stuck for 3 min - performing a safe refresh",
-                    level=WorkflowEventLevel.WARN,
+                    f"in queue - {detail}",
+                    context={"position": pos, "users_ahead": ahead},
                 )
-                try:
-                    await page.reload(wait_until="domcontentloaded")
-                except Exception:  # noqa: BLE001
-                    pass
-
             await asyncio.sleep(3)
 
-    async def _notify_queue(
-        self,
-        context: PluginContext,
-        status: QueueStatus,
-        *,
-        first: bool = False,
-        cleared: bool = False,
-    ) -> None:
-        """Emit a queue-state event. The runner mirrors WARNING-level queue
-        events to desktop / Telegram / Discord channels."""
-
-        if cleared:
-            msg = "Queue cleared - automation is selecting your package now."
-        elif first:
-            msg = f"You are in the waiting room. Position: {status.position or 'unknown'}."
-        else:
-            msg = f"Queue position: {status.position or 'unknown'}."
-        await context.emit_event(msg, level=WorkflowEventLevel.WARN)
 
     async def _select_package_with_fallback(
         self,
