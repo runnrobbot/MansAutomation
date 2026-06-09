@@ -549,41 +549,23 @@ class TiketComPlugin(AutomationPlugin):
 
         Detection order (most reliable first):
 
-          1. A visible login affordance ('Masuk' / 'Daftar' / 'Sign in' /
-             'Login' / a link to /login) => DEFINITELY anonymous.
-          2. A profile-menu / account / avatar element, OR a strong auth
-             cookie => signed in.
-          3. Header present but no login affordance => signed in (tiket.com
-             always shows a login button to anonymous visitors).
-
-        Combining the negative and positive signals avoids both the
-        false-positive (skipping login when anonymous) and the false-negative
-        (sending an authenticated user to the login page).
+          1. A strong auth cookie => signed in. Authoritative and independent
+             of rendering, so checked FIRST. tiket.com server-renders a
+             'Masuk/Sign in' button before hydration swaps it for the profile
+             menu, so trusting the DOM first produced a false 'anonymous' on a
+             slow page (the bug that aborted real sessions). The cookie check
+             is a single, fast context read - no waiting.
+          2. A profile-menu / account / avatar element => signed in.
+          3. A visible login affordance ('Masuk' / 'Sign in' / link to
+             /login) => anonymous.
+          4. Header present but no login affordance => signed in.
         """
 
-        # 1) Login affordance => anonymous.  Checked first and thoroughly.
-        login_affordances = (
-            "header a[href*='/login' i]",
-            "a[href*='account.bliblitiket' i]",
-            "header button:has-text('Masuk')",
-            "header button:has-text('Daftar')",
-            "header a:has-text('Masuk')",
-            "header a:has-text('Daftar')",
-            "header :text-is('Masuk')",
-            "header :text-is('Sign in')",
-            "header :text-is('Log in')",
-            "[data-testid*='loginButton' i]",
-            "[data-testid*='signInButton' i]",
-            "[data-testid*='registerButton' i]",
-        )
-        for selector in login_affordances:
-            try:
-                if await page.locator(selector).first.is_visible(timeout=400):
-                    return False
-            except Exception:  # noqa: BLE001
-                continue
+        # 1) Authoritative cookie probe (fast, hydration-independent).
+        if await self._has_auth_cookie(page):
+            return True
 
-        # 2a) Positive DOM signals.
+        # 2) Positive DOM signals.
         positive_selectors = (
             "[data-testid='headerProfileMenu']",
             "[data-testid='profileMenu']",
@@ -608,38 +590,72 @@ class TiketComPlugin(AutomationPlugin):
             except Exception:  # noqa: BLE001
                 continue
 
-        # 2b) Strong auth-cookie probe (exact names only).
+        # 3) Login affordance => anonymous.
+        login_affordances = (
+            "header a[href*='/login' i]",
+            "a[href*='account.bliblitiket' i]",
+            "header button:has-text('Masuk')",
+            "header button:has-text('Daftar')",
+            "header a:has-text('Masuk')",
+            "header a:has-text('Daftar')",
+            "header :text-is('Masuk')",
+            "header :text-is('Sign in')",
+            "header :text-is('Log in')",
+            "[data-testid*='loginButton' i]",
+            "[data-testid*='signInButton' i]",
+            "[data-testid*='registerButton' i]",
+        )
+        for selector in login_affordances:
+            try:
+                if await page.locator(selector).first.is_visible(timeout=400):
+                    return False
+            except Exception:  # noqa: BLE001
+                continue
+
+        # 4) Header present, no login affordance => signed in.
+        try:
+            if await page.locator("header").first.is_visible(timeout=400):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    async def _has_auth_cookie(self, page: Page) -> bool:
+        """True if the context holds a tiket/blibli authentication cookie."""
+
         try:
             cookies = await page.context.cookies()
         except Exception:  # noqa: BLE001
-            cookies = []
-        strong_auth_cookies = {
+            return False
+        # Substrings that reliably indicate an authenticated session.
+        auth_markers = (
             "ssotkn",
             "accesstoken",
             "access_token",
+            "refreshtoken",
+            "refresh_token",
             "blibliticket-jwt",
             "tiket_session",
             "tiket-session-id",
             "islogin",
             "is_login",
-        }
+            "memberid",
+            "member_id",
+        )
+        # Names that contain a token/login substring but are NOT auth state.
+        negative_markers = ("csrf", "guest", "anon", "device", "visitor")
         for cookie in cookies:
             try:
                 name = str(cookie.get("name", "")).lower()
                 value = str(cookie.get("value", "")).strip()
             except Exception:  # noqa: BLE001
                 continue
-            if not value or value.lower() in {"false", "0", "null"}:
+            if not value or value.lower() in {"false", "0", "null", "none"}:
                 continue
-            if name in strong_auth_cookies:
+            if any(neg in name for neg in negative_markers):
+                continue
+            if any(marker in name for marker in auth_markers):
                 return True
-
-        # 3) Header present but no login affordance => signed in.
-        try:
-            if await page.locator("header").first.is_visible(timeout=400):
-                return True
-        except Exception:  # noqa: BLE001
-            pass
         return False
 
     async def _probe_existing_session(self, page: Page, context: PluginContext) -> bool:
@@ -689,7 +705,13 @@ class TiketComPlugin(AutomationPlugin):
         await context.emit_event("navigating to events search", context={"url": target})
         nav_ok = True
         try:
-            await page.goto(target, wait_until="domcontentloaded")
+            # Wait only for the navigation to commit (server responded) instead
+            # of full 'domcontentloaded'. On a slow tiket.com the latter can
+            # burn the whole 25s default timeout, leaving no time for the event
+            # cards to render and forcing the home-page UI fallback (the
+            # confusing "balik ke beranda"). We wait for the cards themselves
+            # right after, which is the signal that actually matters.
+            await page.goto(target, wait_until="commit", timeout=30_000)
         except Exception as exc:  # noqa: BLE001
             nav_ok = False
             await context.emit_event(
@@ -728,7 +750,7 @@ class TiketComPlugin(AutomationPlugin):
         # Fallback: only reached when the search URL didn't render any cards
         # (e.g. tiket.com changed its URL contract or the result page renders
         # via the home-page search bar).
-        await page.goto(_HOME_URL, wait_until="domcontentloaded")
+        await self._open_event_page(page, context, _HOME_URL)
         await self._submit_search_via_ui(page, context, query)
         try:
             await page.wait_for_selector(
@@ -823,6 +845,36 @@ class TiketComPlugin(AutomationPlugin):
 
     # ----------------------------------------------------------- booking flow
 
+    async def _open_event_page(
+        self, page: Page, context: PluginContext, url: str
+    ) -> None:
+        """Navigate to an event/queue page resiliently.
+
+        Under high traffic the tiket.com event page is slow and frequently
+        redirects straight into the queue-it waiting room, so waiting for
+        ``domcontentloaded`` within the default navigation timeout often fails
+        and (previously) aborted the whole workflow right after "starting".
+
+        We instead wait only for the navigation to *commit* (the server's
+        response headers arrive) with a generous timeout, then settle the DOM
+        best-effort. A slow or heavy load must never hard-fail booking - the
+        downstream queue detection and CTA waits handle the real page state.
+        """
+
+        try:
+            await page.goto(url, wait_until="commit", timeout=60_000)
+        except Exception as exc:  # noqa: BLE001
+            first_line = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+            await context.emit_event(
+                f"navigation still loading, continuing: {first_line}"[:160],
+                level=WorkflowEventLevel.WARN,
+            )
+        # Give the DOM a chance to parse, but never raise on a slow page.
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=20_000)
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _book(
         self,
         page: Page,
@@ -860,7 +912,7 @@ class TiketComPlugin(AutomationPlugin):
                 "target URL is an event page - opening directly (skipping search)",
                 context={"url": target_url},
             )
-            await page.goto(target_url, wait_until="domcontentloaded")
+            await self._open_event_page(page, context, target_url)
             result_data["event"] = {"url": target_url, "title": event_title or "(direct URL)"}
         else:
             if not query and not event_title:
@@ -883,7 +935,7 @@ class TiketComPlugin(AutomationPlugin):
                 )
             result_data["event"] = target
             await context.emit_event("opening event page", context={"url": target["url"]})
-            await page.goto(target["url"], wait_until="domcontentloaded")
+            await self._open_event_page(page, context, target["url"])
 
         await self._await_human_when_needed(page, context)
 
@@ -2268,20 +2320,33 @@ class TiketComPlugin(AutomationPlugin):
         if not events:
             return None
         target_norm = target.lower()
-        best: tuple[int, dict[str, str]] | None = None
+        # Numbers in the query (e.g. "DAY 2", "CAT 1") are highly distinctive:
+        # plain fuzzy matching scores "... DAY 1" and "... DAY 2" almost
+        # identically, so a search for day 2 could open day 1. Reward titles
+        # that share the query's number and penalise titles carrying a
+        # different one.
+        target_nums = set(re.findall(r"\d+", target_norm))
+        best: tuple[float, int, dict[str, str]] | None = None
         for entry in events:
             title = entry.get("title", "").lower()
             if not title:
                 continue
-            score = fuzz.partial_ratio(target_norm, title)
+            base = fuzz.partial_ratio(target_norm, title)
+            score = float(base)
+            if target_nums:
+                title_nums = set(re.findall(r"\d+", title))
+                if target_nums & title_nums:
+                    score += 30.0
+                elif title_nums:
+                    score -= 30.0
             if best is None or score > best[0]:
-                best = (score, entry)
+                best = (score, base, entry)
         if best is None:
             return None
-        if best[0] < 55:
-            # Too weak a match - fall back to the first card.
+        if best[1] < 55:
+            # Too weak a (base) match - fall back to the first card.
             return events[0]
-        return best[1]
+        return best[2]
 
     async def _wait_for_packages(self, page: Page, context: PluginContext) -> None:
         """Wait for the packages page to fully render all Pilih/Select buttons."""
