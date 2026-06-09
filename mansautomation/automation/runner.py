@@ -381,6 +381,12 @@ class WorkflowRunner:
             signal = await self._intervention_detector.detect(page)
         if signal is None:
             return
+        # Queues / waiting rooms are handled automatically by plugins that
+        # support them (they actively wait and track position). Don't pause
+        # the workflow for a queue here - only genuine CAPTCHA / anti-bot
+        # challenges require a human.
+        if signal.reason == "queue" and not force:
+            return
         self._human_signal = signal
         self._human_event.clear()
         await self._publish_status(

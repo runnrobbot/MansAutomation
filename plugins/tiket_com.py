@@ -2781,6 +2781,11 @@ class TiketComPlugin(AutomationPlugin):
                 return
         if signal is None:
             return
+        # Queues / waiting rooms are handled automatically by
+        # _wait_through_queue, so do NOT pause for them here - only pause for
+        # genuine CAPTCHA / anti-bot challenges that need a human.
+        if signal.reason == "queue":
+            return
         await context.request_human(signal.detail, url=signal.url)
         if context.is_aborted():
             raise HumanInterventionRequired(signal.reason, url=signal.url)
