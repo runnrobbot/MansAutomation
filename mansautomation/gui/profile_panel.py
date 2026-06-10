@@ -276,10 +276,6 @@ class ProfilePanel(QWidget):
         profiles = await self._profile_manager.list_profiles()
         self.profiles_loaded.emit(profiles)
 
-    async def _reload(self) -> None:
-        profiles = await self._profile_manager.list_profiles()
-        self.profiles_loaded.emit(list(profiles))
-
     def _on_profiles_changed(self, profiles: list[Profile]) -> None:
         self.profiles_loaded.emit(list(profiles))
 

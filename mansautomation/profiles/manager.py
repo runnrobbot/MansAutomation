@@ -61,13 +61,6 @@ class ProfileManager:
         self._cache[profile.id] = profile
         return profile
 
-    async def get_by_name(self, name: str) -> Profile | None:
-        normalized = name.strip().lower()
-        for profile in self._cache.values():
-            if profile.name.lower() == normalized:
-                return profile
-        return None
-
     async def save(self, profile: Profile) -> Profile:
         if not profile.name.strip():
             raise ProfileError("profile name must not be empty")

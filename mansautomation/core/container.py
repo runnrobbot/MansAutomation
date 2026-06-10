@@ -55,12 +55,6 @@ class Container:
             self._lifecycle.append(instance)
         return cast(T, instance)
 
-    def try_resolve(self, key: type[T]) -> T | None:
-        try:
-            return self.resolve(key)
-        except RuntimeError:
-            return None
-
     async def start_async_services(self) -> None:
         async with self._lock:
             if self._started:

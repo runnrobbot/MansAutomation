@@ -74,9 +74,3 @@ class CryptoService:
             raise CryptoError("ciphertext authentication failed") from exc
         except Exception as exc:  # noqa: BLE001
             raise CryptoError(f"decryption failed: {exc}") from exc
-
-    def encrypt_str(self, plaintext: str) -> bytes:
-        return self.encrypt(plaintext.encode("utf-8"))
-
-    def decrypt_str(self, payload: bytes) -> str:
-        return self.decrypt(payload).decode("utf-8")
