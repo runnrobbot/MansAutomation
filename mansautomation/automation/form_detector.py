@@ -28,6 +28,12 @@ class DetectionReport:
     detected: list[DetectedField]
     unknown: list[FieldDescriptor]
 
+    def by_key(self) -> dict[FieldKey, list[DetectedField]]:
+        result: dict[FieldKey, list[DetectedField]] = {}
+        for entry in self.detected:
+            result.setdefault(entry.field_key, []).append(entry)
+        return result
+
 
 class FormDetectionEngine:
     """Maps each detected DOM field to a canonical :class:`FieldKey`."""

@@ -54,6 +54,9 @@ class PluginManager:
     def get(self, plugin_id: str) -> AutomationPlugin | None:
         return self._plugins.get(plugin_id)
 
+    def for_url(self, url: str) -> list[AutomationPlugin]:
+        return [p for p in self._plugins.values() if p.matches(url)]
+
     async def reload(self) -> list[AutomationPlugin]:
         async with self._lock:
             await self._teardown_unlocked()
