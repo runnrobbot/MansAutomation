@@ -36,6 +36,10 @@ class BrowserService:
         self._browser: Browser | None = None
         self._contexts: dict[str, BrowserContext] = {}
         self._context_last_used: dict[str, float] = {}
+        # Sessions currently held by a running workflow. An active session is
+        # NEVER torn down by the idle reaper, no matter how long it waits (a
+        # queue / pre-queue wait can legitimately run for hours).
+        self._active_sessions: dict[str, int] = {}
         self._lock = asyncio.Lock()
         self._preload_task: asyncio.Task[None] | None = None
         self._idle_reaper_task: asyncio.Task[None] | None = None
@@ -204,6 +208,27 @@ class BrowserService:
         page = await context.new_page()
         return page
 
+    def mark_active(self, session_name: str) -> None:
+        """Pin a session as in-use by a running workflow.
+
+        While pinned, the idle reaper will not tear the context down even if it
+        sits on the same page for hours (e.g. a pre-queue countdown). Safe to
+        call more than once; balanced by :meth:`release`.
+        """
+
+        self._active_sessions[session_name] = self._active_sessions.get(session_name, 0) + 1
+        self._context_last_used[session_name] = asyncio.get_event_loop().time()
+
+    def release(self, session_name: str) -> None:
+        """Unpin a session when a workflow finishes and restart its idle timer."""
+
+        remaining = self._active_sessions.get(session_name, 0) - 1
+        if remaining <= 0:
+            self._active_sessions.pop(session_name, None)
+        else:
+            self._active_sessions[session_name] = remaining
+        self._context_last_used[session_name] = asyncio.get_event_loop().time()
+
     async def close_session(self, session_name: str) -> None:
         async with self._lock:
             context = self._contexts.pop(session_name, None)
@@ -298,6 +323,10 @@ class BrowserService:
                 victims: list[str] = []
                 async with self._lock:
                     for name, last_used in list(self._context_last_used.items()):
+                        if name in self._active_sessions:
+                            # A workflow is actively using this context (e.g.
+                            # waiting in a queue). Never reap it mid-run.
+                            continue
                         if now - last_used >= self._idle_ttl_seconds:
                             victims.append(name)
                 for name in victims:

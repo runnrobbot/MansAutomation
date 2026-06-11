@@ -262,7 +262,11 @@ class WorkflowRunner:
 
     @asynccontextmanager
     async def _page_for(self, job: WorkflowJob) -> AsyncIterator[Page]:
-        context = await self._browser_service.acquire_context(session_name=f"job-{job.plugin_id}")
+        session_name = f"job-{job.plugin_id}"
+        context = await self._browser_service.acquire_context(session_name=session_name)
+        # Pin the session so the idle reaper never closes it mid-workflow - a
+        # pre-queue / queue wait can run for hours on the same page.
+        self._browser_service.mark_active(session_name)
         page = await context.new_page()
         watchers = await self._start_resilience_watchers(page, job)
         try:
@@ -273,6 +277,7 @@ class WorkflowRunner:
                 await page.close()
             except Exception:  # noqa: BLE001
                 pass
+            self._browser_service.release(session_name)
 
     async def _start_resilience_watchers(
         self, page: Page, job: WorkflowJob
