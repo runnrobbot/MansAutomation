@@ -1206,14 +1206,17 @@ class TiketComPlugin(AutomationPlugin):
 
             current = await detector.detect(page)
 
-            # Open signals: detector says open OR the buy button is clickable.
-            if current.is_open or await self._is_buy_button_ready(page):
+            # Open only when truly confirmed. A bare detector ``is_open`` can be
+            # a transient post-reload state where the countdown widget has not
+            # hydrated yet, so the page momentarily lacks the "sale starts"
+            # phrase and looks open. ``_sale_really_open`` verifies it.
+            if await self._sale_really_open(page, context, detector, current):
                 await context.emit_event("sale is now open - resuming automatically")
                 try:
                     await page.wait_for_load_state("domcontentloaded", timeout=8_000)
                 except Exception:  # noqa: BLE001
                     pass
-                return SaleStatus(is_open=True, detail="sale opened", url=page.url)
+                return SaleStatus(is_open=True, detail="sale opened")
 
             remaining = current.seconds_until_open
             now = loop.time()
@@ -1235,10 +1238,12 @@ class TiketComPlugin(AutomationPlugin):
                         raise HumanInterventionRequired("workflow aborted while waiting for sale")
                     if await self._is_buy_button_ready(page):
                         await context.emit_event("buy button is live - resuming")
-                        return SaleStatus(is_open=True, detail="sale opened", url=page.url)
+                        return SaleStatus(is_open=True, detail="sale opened")
                     refreshed = await detector.detect(page)
-                    if refreshed.is_open:
-                        return SaleStatus(is_open=True, detail="sale opened", url=page.url)
+                    if refreshed.is_open and await self._sale_really_open(
+                        page, context, detector, refreshed
+                    ):
+                        return SaleStatus(is_open=True, detail="sale opened")
                     await asyncio.sleep(1)
                     # Reload every ~10s in the tight phase so a stale countdown
                     # widget can't keep the page disabled past the open time.
@@ -1278,8 +1283,8 @@ class TiketComPlugin(AutomationPlugin):
 
         # Budget exhausted - final check then hand back to the operator.
         final = await detector.detect(page)
-        if final.is_open or await self._is_buy_button_ready(page):
-            return SaleStatus(is_open=True, detail="sale opened", url=page.url)
+        if await self._sale_really_open(page, context, detector, final):
+            return SaleStatus(is_open=True, detail="sale opened")
         await context.request_human(
             f"Sale has not opened within the wait window ({final.detail}). "
             "Resume when the buy button is live.",
@@ -1324,6 +1329,42 @@ class TiketComPlugin(AutomationPlugin):
             )
         except Exception:  # noqa: BLE001
             return False
+
+    async def _sale_really_open(
+        self,
+        page: Page,
+        context: PluginContext,
+        detector: SaleStatusDetector,
+        candidate: SaleStatus | None = None,
+    ) -> bool:
+        """Authoritatively decide whether the sale is open.
+
+        An enabled buy CTA is the fast, reliable signal -> open immediately
+        (no added latency on the critical path the operator cares about).
+
+        A detector ``is_open`` on its own is treated as a *candidate* only:
+        right after a reload the countdown widget may not have hydrated yet, so
+        the page text transiently lacks the "sale starts" phrase and looks
+        open. We confirm by letting the page settle and re-checking, which
+        eliminates the premature "sale is now open" false positive that fired
+        ~14h before the real sale time.
+        """
+
+        if await self._is_buy_button_ready(page):
+            return True
+        status = candidate if candidate is not None else await detector.detect(page)
+        if not status.is_open:
+            return False
+        # Candidate "open" with no live buy button yet: verify it is not a
+        # transient post-reload / un-hydrated state before committing.
+        try:
+            await context.sync.wait_for_hydration(page, timeout_ms=4_000)
+            await context.sync.wait_for_dom_settle(page, quiet_ms=300, timeout_ms=3_000)
+        except Exception:  # noqa: BLE001
+            pass
+        if await self._is_buy_button_ready(page):
+            return True
+        return (await detector.detect(page)).is_open
 
     @staticmethod
     def _format_duration(seconds: int) -> str:
@@ -2682,7 +2723,7 @@ class TiketComPlugin(AutomationPlugin):
                     }
                     // Fallback: any 1-3 digit number that sits next to '/pax'.
                     const all = el.querySelectorAll('*');
-                    for (const node of all) {
+                    for (const node of all) {;;;;;;['''''''''''''''''''''''''''''''''''''''''''''''''''''''']
                         const t = (node.innerText || '').trim();
                         if (/^\\d{1,3}$/.test(t)) {
                             return parseInt(t, 10);

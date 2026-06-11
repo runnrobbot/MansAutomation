@@ -10,8 +10,9 @@ Only one primitive is exported:
 - :class:`HeartbeatWatchdog` - polls a lightweight liveness probe at a fixed
   interval and emits ``heartbeat_unhealthy`` / ``heartbeat_recovered`` events.
   Used to detect tab freezes and dead browser pages. It never touches the
-  page beyond a read-only ``document.hidden`` check, so it is safe to run
-  during a queue / waiting-room wait.
+  page beyond a read-only "can the page execute JS" check, so it is safe to
+  run during a queue / waiting-room wait. A backgrounded / minimised window is
+  NOT treated as unhealthy - only a frozen or closed page is.
 
 Queue / waiting-room progression is tracked authoritatively by the plugin's
 own ``_wait_through_queue`` (which reads queue-it's embedded JSON model), so
@@ -134,7 +135,9 @@ class HeartbeatWatchdog:
         try:
             return bool(
                 await asyncio.wait_for(
-                    self._page.evaluate("() => typeof document !== 'undefined' && !document.hidden"),
+                    self._page.evaluate(
+                        "() => typeof document !== 'undefined' && !!document.documentElement"
+                    ),
                     timeout=self._probe_timeout,
                 )
             )
