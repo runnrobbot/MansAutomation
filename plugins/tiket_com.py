@@ -1461,6 +1461,16 @@ class TiketComPlugin(AutomationPlugin):
         # Whether we've announced the aggressive final-stretch polling.
         final_stretch_announced = False
 
+        # Authoritative context remembered across iterations so a transient
+        # degraded read (main frame momentarily unresponsive -> only a queue-it
+        # panel iframe answers, with no real state) cannot erase what we know
+        # or be mistaken for a real before->queue phase change.
+        known_phase = status.phase if status.has_state else "unknown"
+        known_secs: int | None = status.seconds_until_start_now()
+        known_secs_at = loop.time()
+        # Monotonic time the page first looked unresponsive (degraded reads).
+        degraded_since: float | None = None
+
         while True:
             if context.is_aborted():
                 raise HumanInterventionRequired("workflow aborted while in queue")
@@ -1554,7 +1564,44 @@ class TiketComPlugin(AutomationPlugin):
                 continue
             conn_lost_at = None
 
+            # --- Robust phase resolution ----------------------------------
+            # Remember authoritative timing/phase only from a state-bearing
+            # read. A degraded read (has_state=False) means the main frame did
+            # not answer - we must not let it flip us out of the countdown.
+            real_secs = current.seconds_until_start_now()
+            if current.has_state:
+                if real_secs is not None:
+                    known_secs = real_secs
+                    known_secs_at = now
+                if current.phase in ("before", "queue"):
+                    known_phase = current.phase
+
+            # Estimated seconds to sale start, carried forward from the last
+            # good reading using the wall clock.
+            if known_secs is not None:
+                est_secs: int | None = max(0, int(known_secs - (now - known_secs_at)))
+            else:
+                est_secs = None
+
+            degraded = not current.has_state
+
             if current.phase == "before":
+                effective_phase = "before"
+            elif current.phase == "queue" and current.has_state:
+                effective_phase = "queue"
+            elif known_phase == "queue":
+                # We genuinely entered the live queue earlier; stay there.
+                effective_phase = "queue"
+            elif est_secs is not None and est_secs > 0:
+                # Degraded/unknown read but the sale has not started yet: we are
+                # still in the pre-queue countdown, NOT the live queue. This is
+                # the fix for the "in queue - position calculating" loop that
+                # appeared ~1h before sale time when the main frame stalled.
+                effective_phase = "before"
+            else:
+                effective_phase = "queue"
+
+            if effective_phase == "before":
                 # Pre-queue countdown. queue-it's OWN JavaScript polls its
                 # server and, at the exact sale moment, redirects this page
                 # into the live queue. THAT automatic redirect is what assigns
@@ -1563,7 +1610,33 @@ class TiketComPlugin(AutomationPlugin):
                 # re-joins you a few seconds late, landing you tens of
                 # thousands of places further back. We only watch (read-only)
                 # and let queue-it move us.
-                secs = current.seconds_until_start_now()
+                #
+                # EXCEPTION - recovery: if the page is unresponsive (degraded
+                # reads) for a sustained period AND we are comfortably before
+                # sale time, reload once to recover. This is safe here: no
+                # position is assigned during pre-queue, and queue-it preserves
+                # the place via cookie. We never do this within 120s of sale
+                # time, to avoid disturbing the position-assigning transition.
+                if degraded:
+                    if degraded_since is None:
+                        degraded_since = now
+                    elif (now - degraded_since) >= 30 and (est_secs is None or est_secs > 120):
+                        degraded_since = now
+                        await context.emit_event(
+                            "waiting-room page unresponsive - refreshing to "
+                            "recover (place preserved, far from sale time)",
+                            level=WorkflowEventLevel.WARN,
+                        )
+                        try:
+                            await page.reload(wait_until="domcontentloaded")
+                        except Exception:  # noqa: BLE001
+                            pass
+                        await asyncio.sleep(2)
+                        continue
+                else:
+                    degraded_since = None
+
+                secs = est_secs
 
                 # Announce the final stretch once, then poll harder so the
                 # operator can see the system is armed and ready.

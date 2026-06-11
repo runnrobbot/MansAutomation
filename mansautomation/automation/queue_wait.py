@@ -93,6 +93,12 @@ class QueueStatus:
     queue_paused: bool = False
     challenge: bool = False
     is_queueit: bool = False
+    # True when the reading came from a frame carrying the authoritative queue
+    # state (knockout view model, before/queue body class, or the position
+    # spans). False means a degraded read - e.g. only a queue-it panel iframe
+    # responded because the main frame was momentarily unresponsive. Callers
+    # must NOT treat a degraded read as a phase change.
+    has_state: bool = False
     detail: str = ""
     url: str = ""
 
@@ -132,6 +138,13 @@ _QUEUEIT_EXTRACT_JS = r"""() => {
     if (/\bqueue\b/.test(cls) && !/\bbefore\b/.test(cls)) out.phase = 'queue';
     else if (/\bbefore\b/.test(cls)) out.phase = 'before';
     else out.phase = 'unknown';
+
+    // Whether THIS frame carries the authoritative queue state. A queue-it
+    // panel iframe matches looksQueueit (it references queue-it.net) but has
+    // none of these, so it reports hasState=false and callers can ignore it.
+    out.hasState = !!window.queueViewModel
+        || /\b(before|queue)\b/.test(cls)
+        || !!document.getElementById('MainPart_lbQueueNumber');
 
     const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
     const txt = (id) => {
@@ -266,6 +279,7 @@ class QueueDetector:
                 queue_paused=bool(qi.get("queuePaused")),
                 challenge=bool(qi.get("challenge")),
                 is_queueit=True,
+                has_state=bool(qi.get("hasState")),
                 detail=(
                     "queue-it pre-queue (sale not started)"
                     if phase == "before"
@@ -303,20 +317,46 @@ class QueueDetector:
         return QueueStatus(in_queue=False, phase="unknown", url=url)
 
     async def _extract_queueit(self, page: Page) -> dict | None:
-        # Try the main frame, then any child frame (queue-it can be iframed).
-        targets = [page.main_frame]
+        """Read queue-it's embedded model, preferring the frame that actually
+        carries the queue state.
+
+        The main frame is authoritative in the healthy case. If it is
+        momentarily unresponsive (page busy / self-refresh / renderer hiccup),
+        ``evaluate`` raises and we fall back to child frames - but a queue-it
+        *panel* iframe only references queue-it without holding the real state
+        (``hasState`` is false). We must return that degraded result only when
+        no state-bearing frame is available, so the caller can tell a genuine
+        phase change apart from a transient read failure.
+        """
+
+        # 1) Main frame first - the common, healthy path (single evaluate).
+        main_data: dict | None = None
         try:
-            targets += [f for f in page.frames if f is not page.main_frame]
+            data = await page.main_frame.evaluate(_QUEUEIT_EXTRACT_JS)
+            if isinstance(data, dict) and data.get("isQueueit"):
+                main_data = data
+                if data.get("hasState"):
+                    return data
         except Exception:  # noqa: BLE001
-            pass
-        for target in targets:
+            main_data = None
+
+        # 2) Main frame dead/degraded - scan child frames, preferring one that
+        #    carries real state; otherwise keep the degraded fallback.
+        fallback = main_data
+        try:
+            frames = [f for f in page.frames if f is not page.main_frame]
+        except Exception:  # noqa: BLE001
+            frames = []
+        for frame in frames:
             try:
-                data = await target.evaluate(_QUEUEIT_EXTRACT_JS)
+                data = await frame.evaluate(_QUEUEIT_EXTRACT_JS)
             except Exception:  # noqa: BLE001
                 continue
             if isinstance(data, dict) and data.get("isQueueit"):
-                return data
-        return None
+                if data.get("hasState"):
+                    return data
+                fallback = fallback or data
+        return fallback
 
     @staticmethod
     def _all_urls(page: Page) -> list[str]:
